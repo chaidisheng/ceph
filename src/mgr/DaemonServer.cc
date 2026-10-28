@@ -19,6 +19,7 @@
 
 #include "include/stringify.h"
 #include "include/str_list.h"
+#include "include/variant_print.h"
 #include "auth/RotatingKeyRing.h"
 #include "json_spirit/json_spirit_writer.h"
 
@@ -103,11 +104,11 @@ DaemonServer::DaemonServer(MonClient *monc_,
 				     g_conf().get_val<uint64_t>("mgr_osd_messages"))),
       mds_byte_throttler(new Throttle(g_ceph_context, "mgr_mds_bytes",
 				      g_conf().get_val<Option::size_t>("mgr_mds_bytes"))),
-      mds_msg_throttler(new Throttle(g_ceph_context, "mgr_mds_messsages",
+      mds_msg_throttler(new Throttle(g_ceph_context, "mgr_mds_messages",
 				     g_conf().get_val<uint64_t>("mgr_mds_messages"))),
       mon_byte_throttler(new Throttle(g_ceph_context, "mgr_mon_bytes",
 				      g_conf().get_val<Option::size_t>("mgr_mon_bytes"))),
-      mon_msg_throttler(new Throttle(g_ceph_context, "mgr_mon_messsages",
+      mon_msg_throttler(new Throttle(g_ceph_context, "mgr_mon_messages",
 				     g_conf().get_val<uint64_t>("mgr_mon_messages"))),
       msgr(nullptr),
       monc(monc_),
@@ -2632,7 +2633,11 @@ bool DaemonServer::_handle_command(
       auto rgw_daemons = daemon_state.get_by_service("rgw");
       for (auto& rgw_daemon : rgw_daemons) {
 	DaemonStatePtr daemon = rgw_daemon.second;
-	string name = daemon->metadata.find("id")->second;
+	string name;
+	{
+	  std::lock_guard l(daemon->lock);
+	  name = daemon->metadata.find("id")->second;
+	}
 	/*
 	 * The id stored in the metadata is the port number
 	 * for the RGW daemon.

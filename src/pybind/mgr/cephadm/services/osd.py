@@ -18,7 +18,7 @@ from ceph.utils import datetime_now
 from orchestrator import OrchestratorError, DaemonDescription, DaemonDescriptionStatus
 from mgr_module import MonCommandFailed
 
-from cephadm.services.cephadmservice import CephadmDaemonDeploySpec, CephService
+from cephadm.services.cephadmservice import CephadmDaemonDeploySpec, CephService, DaemonDeployContext
 from .service_registry import register_cephadm_service
 
 if TYPE_CHECKING:
@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 @register_cephadm_service
 class OSDService(CephService):
     TYPE = 'osd'
+
+    def validate_encryption(self, spec: DriveGroupSpec) -> None:
+        if spec.method == 'raw' and spec.encrypted and not spec.tpm2:
+            raise OrchestratorError(
+                'Raw encrypted OSD deployment through cephadm requires tpm2: true. '
+                'Use method: lvm for encryption without TPM2.')
 
     def _apply_osd_config_to_daemon(
         self,
@@ -94,6 +100,7 @@ class OSDService(CephService):
             in inventory timestamps (and the check only compares timestamps, not spec content).
         """
         logger.debug(f"Processing DriveGroup {drive_group}")
+        self.validate_encryption(drive_group)
         creation_cfg, post_create_cfg = self._get_osd_spec_configs(drive_group)
         osd_id_claims = OsdIdClaims(self.mgr)
         if osd_id_claims.get():
@@ -235,7 +242,8 @@ class OSDService(CephService):
                     daemon_type='osd',
                     network='',  # required arg but only really needed for mons
                 )
-                daemon_spec.final_config, daemon_spec.deps = self.generate_config(daemon_spec)
+                daemon_spec.final_config, daemon_spec.deps = self.generate_config(
+                    DaemonDeployContext(daemon_spec, spec))
                 self._apply_osd_config_to_daemon(str(osd_id), post_create_cfg or {})
 
                 await CephadmServe(self.mgr)._create_daemon(
@@ -279,7 +287,8 @@ class OSDService(CephService):
                 daemon_type='osd',
                 network='',  # required arg but only really needed for mons
             )
-            daemon_spec.final_config, daemon_spec.deps = self.generate_config(daemon_spec)
+            daemon_spec.final_config, daemon_spec.deps = self.generate_config(
+                DaemonDeployContext(daemon_spec, spec))
             self._apply_osd_config_to_daemon(osd_id, post_create_cfg or {})
             await CephadmServe(self.mgr)._create_daemon(
                 daemon_spec,
@@ -506,8 +515,12 @@ class OSDService(CephService):
         if not is_failed_deploy:
             super().post_remove(daemon, is_failed_deploy=is_failed_deploy)
 
-    def generate_config(self, daemon_spec: CephadmDaemonDeploySpec) -> Tuple[Dict[str, Any], List[str]]:
-        config, parent_deps = super().generate_config(daemon_spec)
+    def generate_config(
+            self,
+            deploy_ctx: DaemonDeployContext,
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        daemon_spec = deploy_ctx.daemon_spec
+        config, parent_deps = super().generate_config(deploy_ctx)
         if daemon_spec.service_name in self.mgr.spec_store:
             svc_spec = cast(DriveGroupSpec, self.mgr.spec_store[daemon_spec.service_name].spec)
 
@@ -1072,7 +1085,9 @@ class OSDRemovalQueue(object):
                             f"Could not destroy {osd}")
                     logger.info(
                         f"Successfully destroyed old {osd} on {osd.hostname}; ready for replacement")
-                    osd.zap = True
+                    # device replace needs a zap so ceph-volume can set being_replaced
+                    if any([osd.replace_block, osd.replace_db, osd.replace_wal]):
+                        osd.zap = True
                 else:
                     if not osd.purge():
                         raise orchestrator.OrchestratorError(f"Could not purge {osd}")

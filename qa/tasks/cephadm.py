@@ -781,6 +781,10 @@ def ceph_bootstrap(ctx, config):
             cmd += ['--skip-monitoring-stack']
         if config.get('single_host_defaults'):
             cmd += ['--single-host-defaults']
+        if config.get('allow_mismatched_release'):
+            cmd += ['--allow-mismatched-release']
+        if config.get('log_to_file'):
+            cmd += ['--log-to-file']
         if not config.get('avoid_pacific_features', False):
             cmd += ['--skip-admin-label']
         # bootstrap makes the keyring root 0600, so +r it for our purposes
@@ -2196,4 +2200,46 @@ def task(ctx, config):
 
         finally:
             log.info('Teardown begin')
+
+
+            if hasattr(ctx.ceph[cluster_name], 'bootstrap_remote'):
+                log.info('Tearing down any agents...')
+                try:
+                    _shell(
+                        ctx,
+                        cluster_name,
+                        ctx.ceph[cluster_name].bootstrap_remote,
+                        ['ceph', 'config', 'set', 'mgr', 'mgr/cephadm/use_agent', 'false'],
+                        check_status=False,
+                    )
+
+                    log.info('Waiting for agent daemons to be removed (up to 5m)...')
+                    with contextutil.safe_while(
+                        sleep=5,
+                        tries=60,
+                        action='waiting for cephadm agent daemons to stop',
+                    ) as proceed:
+                        while proceed():
+                            r = _shell(
+                                ctx,
+                                cluster_name,
+                                ctx.ceph[cluster_name].bootstrap_remote,
+                                ['ceph', 'orch', 'ps', '--daemon_type', 'agent', '--refresh', '-f', 'json'],
+                                stdout=StringIO(),
+                                check_status=False,
+                            )
+                            if r.exitstatus:
+                                log.warning("'ceph orch ps' command failed with error code {}. Stopping test...".format(r))
+                                return
+                            try:
+                                daemons = json.loads(r.stdout.getvalue())
+                                if not daemons:
+                                    log.info('All agent daemons successfully removed.')
+                                    break
+                                log.info(f'Still waiting for {len(daemons)} agent daemon(s) to be removed...')
+                            except (ValueError, json.JSONDecodeError):
+                                log.warning('Failed to parse orch ps output, will retry...')
+                except Exception as e:
+                    log.warning(f'Encountered exception while waiting for agent teardown: {e}')
+
 

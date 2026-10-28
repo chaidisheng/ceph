@@ -954,6 +954,9 @@ void Migrator::export_dir(CDir *dir, mds_rank_t dest)
   } else if (dir->inode->is_quiesced()) {
     dout(7) << "Cannot export to mds." << dest << " " << *dir << ": is quiesced" << dendl;
     return;
+  } else if (dir->inode->is_under_quarantine()) {
+    dout(7) << "Cannot export to mds." << dest << " " << *dir << ": is under quarantine" << dendl;
+    return;
   }
 
   if (unlikely(g_conf()->mds_thrash_exports)) {
@@ -2435,7 +2438,7 @@ void Migrator::handle_export_discover(const cref_t<MExportDirDiscover> &m, bool 
   // note import state
   dirfrag_t df = m->get_dirfrag();
 
-  if (!mds->is_active()) {
+  if (!started && !mds->is_active()) {
     dout(7) << " not active, send NACK " << dendl;
     mds->send_message_mds(make_message<MExportDirDiscoverAck>(df, m->get_tid(), false), from);
     return;
@@ -2459,6 +2462,14 @@ void Migrator::handle_export_discover(const cref_t<MExportDirDiscover> &m, bool 
       return;
     }
     ceph_assert(it->second.state == IMPORT_DISCOVERING);
+    if (!mds->is_active()) {
+      // e.g. went up:stopping while waiting on path_traverse; nothing is
+      // pinned yet, so just drop the import state and NACK the exporter.
+      dout(7) << " no longer active, send NACK " << dendl;
+      import_reverse_discovering(df);
+      mds->send_message_mds(make_message<MExportDirDiscoverAck>(df, m->get_tid(), false), from);
+      return;
+    }
     p_state = &it->second;
   }
 

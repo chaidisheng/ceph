@@ -56,7 +56,7 @@ from ceph.deployment.drive_group import DeviceSelection
 from ceph.utils import str_to_datetime, datetime_to_str, datetime_now
 from ceph.cryptotools.select import choose_crypto_caller
 from cephadm.serve import CephadmServe
-from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
+from cephadm.services.cephadmservice import CephadmDaemonDeploySpec, DaemonDeployContext
 from cephadm.http_server import CephadmHttpServer
 from cephadm.agent import CephadmAgentHelpers
 from cephadm.services.service_registry import service_registry
@@ -84,7 +84,8 @@ from . import utils
 from . import ssh
 from .cli import CephadmCLICommand
 from .migrations import Migrations
-from .services.cephadmservice import MgrService, RgwService
+from .services.mgr import MgrService
+from .services.rgw import RgwService
 from .services.container import CustomContainerService
 from .services.iscsi import IscsiService
 from .services.mgmt_gateway import MgmtGatewayService
@@ -144,6 +145,10 @@ def os_exit_noop(status: int) -> None:
 os._exit = os_exit_noop   # type: ignore
 
 DEFAULT_IMAGE = 'quay.io/ceph/ceph'
+
+# Pool type constants from include/rados.h / pg_pool_t (CEPH_PG_TYPE_*)
+CEPH_POOL_TYPE_REPLICATED = 1
+CEPH_POOL_TYPE_ERASURE = 3
 
 
 def host_exists(hostname_position: int = 1) -> Callable:
@@ -234,6 +239,15 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             type='secs',
             default=10 * 60,
             desc='How frequently to perform a host check',
+        ),
+        Option(
+            'upgrade_cpu_isa_check',
+            type='bool',
+            default=True,
+            desc='Before upgrading, verify that host CPUs support the x86-64 '
+            'microarchitecture level required by the target release; set to '
+            'false to skip the check (e.g. when using custom-built images '
+            'targeting an older CPU generation)',
         ),
         Option(
             'stray_daemon_check_interval',
@@ -448,6 +462,18 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             desc='Maximum number of OSD daemons upgraded in parallel.'
         ),
         Option(
+            'max_gateway_upgrades_per_pass',
+            type='int',
+            default=16,
+            min=0,
+            desc='Maximum number of gateway daemons (rgw, iscsi, nfs, nvmeof, smb) '
+            'upgraded in a single upgrade pass. For rgw, iscsi, nvmeof and smb this is '
+            'a per-daemon cap and a service larger than it is split across passes. nfs '
+            'daemons are batched by whole services instead, because restarting one nfs '
+            'daemon puts the rest of its service into a grace period, so a pass may '
+            'exceed this value when a single nfs service is larger than it.'
+        ),
+        Option(
             'pg_autoscale_during_upgrade',
             type='bool',
             default=False,
@@ -575,7 +601,33 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
                 'but these log statements may contain sensitive info such as cephx keys. Only relevant '
                 'when logging at debug level'
             )
-        )
+        ),
+        Option(
+            'asyncssh_log_level',
+            type='str',
+            default='INFO',
+            desc=(
+                'asyncssh library log level. Controls the verbosity of the SSH log that '
+                'cephadm captures per connection attempt and writes to the mgr log when a '
+                'connection fails. Default is INFO, WARNING or ERROR reduce the captured '
+                'output. Set to DEBUG only when actively diagnosing SSH connectivity issues.'
+            ),
+            enum_allowed=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        ),
+        Option(
+            'asyncssh_debug_level',
+            type='int',
+            default=0,
+            desc=(
+                'asyncssh library debug verbosity level. Set asyncssh_log_level to DEBUG '
+                'first to see any debug output. 1-3 produce increasing detail (Use 3 = full '
+                'debug cautiously as it may expose passwords in clear text). 0 restores the '
+                'minimum verbosity (asyncssh level 1). To turn debug output off, set '
+                'asyncssh_log_level to INFO, WARNING, or ERROR.'
+            ),
+            min=0,
+            max=3,  # 3 is the maximum level for asyncssh
+        ),
     ]
     for image in DefaultImages:
         MODULE_OPTIONS.append(Option(image.key, default=image.image_ref, desc=image.desc))
@@ -611,6 +663,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             self.allow_lo_routes = False
             self.allow_bgp_routes = False
             self.host_check_interval = 0
+            self.upgrade_cpu_isa_check = True
             self.stray_daemon_check_interval = 0
             self.max_count_per_host = 0
             self.mode = ''
@@ -628,6 +681,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             self.container_image_snmp_gateway = ''
             self.container_image_nginx = ''
             self.container_image_oauth2_proxy = ''
+            self.container_image_pushgateway = ''
             self.container_image_elasticsearch = ''
             self.container_image_jaeger_agent = ''
             self.container_image_jaeger_collector = ''
@@ -675,6 +729,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             self.apply_spec_fails: List[Tuple[str, str]] = []
             self.max_osd_draining_count = 10
             self.max_parallel_osd_upgrades = 16
+            self.max_gateway_upgrades_per_pass = 16
             self.device_enhanced_scan = False
             self.inventory_list_all = False
             self.cgroups_split = True
@@ -693,6 +748,8 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             self.certificate_check_period = 0
             self.cephadm_binary_logging_level = 'debug'
             self.log_deploy_configuration = False
+            self.asyncssh_log_level = 'INFO'
+            self.asyncssh_debug_level = 0
 
         self.notify(NotifyType.mon_map, None)
         self.config_notify()
@@ -1246,6 +1303,18 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
                     return list(ifaces.values())[0][0]
                 logger.error(f'{spec_network} from {sspec.service_name()} spec does not overlap with {host_network} on {host}')
         return None
+
+    def get_bond_members(self, host: str, iface: str) -> Set[str]:
+        """Return the member devices of iface on host, empty if it is not a bond.
+
+        Read from the interface metadata already collected by 'cephadm
+        gather-facts', which reports a bond's member devices as its
+        lower_devs_list.
+        """
+        nic = self.cache.get_facts(host).get('interfaces', {}).get(iface, {})
+        if nic.get('nic_type') != 'bonding':
+            return set()
+        return set(nic.get('lower_devs_list') or [])
 
     @staticmethod
     def can_run() -> Tuple[bool, str]:
@@ -2147,6 +2216,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
                 'nvmeof': self.container_image_nvmeof,
                 'prometheus': self.container_image_prometheus,
                 'promtail': self.container_image_promtail,
+                'pushgateway': self.container_image_pushgateway,
                 'alloy': self.container_image_alloy,
                 'snmp-gateway': self.container_image_snmp_gateway,
                 'mgmt-gateway': self.container_image_nginx,
@@ -2279,6 +2349,11 @@ Then run the following:
             # wrong address so future operations use a fresh connection.
             if addr_changed:
                 self.ssh.reset_con(spec.hostname)
+            # The SSH failure in _check_valid_addr may have added the hostname
+            # to offline_hosts. Only undo that for hosts we never registered.
+            # An existing inventory host that just failed SSH should stay offline.
+            if spec.hostname not in self.inventory:
+                self.offline_hosts_remove(spec.hostname)
             raise
         if spec.addr == spec.hostname and ip_addr:
             spec.addr = ip_addr
@@ -2375,6 +2450,11 @@ Then run the following:
             self.log.error(e)
             raise OrchestratorValidationError(f"Can't perform powercycle on node {hostname}: {e}")
         return f'Powercycle scheduled on {hostname}'
+
+    @handle_orch_error
+    def node_proxy_list_hosts(self) -> List[str]:
+        # Returns hosts with a complete node-proxy report; no blobs loaded.
+        return self.node_proxy_cache.list_hosts()
 
     @handle_orch_error
     def node_proxy_fullreport(self, hostname: Optional[str] = None) -> Dict[str, Any]:
@@ -3160,7 +3240,8 @@ Then run the following:
         # deploy a new keyring file
         if daemon_spec.daemon_type != 'osd':
             daemon_spec = service_registry.get_service(daemon_type_to_service(
-                daemon_spec.daemon_type)).prepare_create(daemon_spec)
+                daemon_spec.daemon_type)).prepare_create(
+                DaemonDeployContext(daemon_spec, self.spec_store.active_specs.get(daemon_spec.service_name)))
         with self.async_timeout_handler(daemon_spec.host, f'cephadm deploy ({daemon_spec.daemon_type} daemon)'):
             self.wait_async(CephadmServe(self)._create_daemon(daemon_spec, reconfig=True))
 
@@ -3246,12 +3327,13 @@ Then run the following:
                 action = 'redeploy'  # to ensure proper behavior since we want redeploy
             if daemon_spec.daemon_type != 'osd':
                 daemon_spec = service_registry.get_service(daemon_type_to_service(
-                    daemon_spec.daemon_type)).prepare_create(daemon_spec)
+                    daemon_spec.daemon_type)).prepare_create(
+                    DaemonDeployContext(daemon_spec, self.spec_store.active_specs.get(daemon_spec.service_name)))
             else:
                 # for OSDs, we still need to update config, just not carry out the full
                 # prepare_create function
                 daemon_spec.final_config, daemon_spec.deps = self.osd_service.generate_config(
-                    daemon_spec)
+                    DaemonDeployContext(daemon_spec, self.spec_store.active_specs.get(daemon_spec.service_name)))
             with self.async_timeout_handler(daemon_spec.host, f'cephadm deploy ({daemon_spec.daemon_type} daemon)'):
                 return self.wait_async(
                     CephadmServe(self)._create_daemon(daemon_spec, reconfig=(action == 'reconfig'),
@@ -3807,6 +3889,7 @@ Then run the following:
 
     @handle_orch_error
     def create_osds(self, drive_group: DriveGroupSpec, skip_validation: bool = False) -> str:
+        self.osd_service.validate_encryption(drive_group)
         hosts: List[HostSpec] = self.inventory.all_specs()
         filtered_hosts: List[str] = drive_group.placement.filter_matching_hostspecs(hosts)
         if not filtered_hosts:
@@ -3877,6 +3960,36 @@ Then run the following:
             raise OrchestratorError(f'Cannot find pool "{pool}" for '
                                     f'service {service_name}')
 
+    def _check_pool_supports_omap(self, pool: str, service_name: str) -> None:
+        osd_map = self.get('osd_map')
+        pools = osd_map.get('pools', []) if isinstance(osd_map, dict) else []
+        pool_info = None
+        for p in pools:
+            if p.get('pool_name') == pool:
+                pool_info = p
+                break
+        if pool_info is None:
+            raise OrchestratorError(
+                f'Pool "{pool}" was not found in the OSD map. '
+                f'Cannot verify OMAP support for service "{service_name}".'
+            )
+        if pool_info.get('type') == CEPH_POOL_TYPE_REPLICATED:
+            return
+        flags_names = pool_info.get('flags_names', '')
+        flags_set = set(f.strip() for f in flags_names.split(',') if f.strip())
+        if 'supports_omap' in flags_set:
+            return
+        raise OrchestratorError(
+            f'Pool "{pool}" does not support OMAP. '
+            f'Service "{service_name}" requires a pool with OMAP support '
+            f'because it uses OMAP objects for gateway state. '
+            f'Use a replicated pool, or enable OMAP support on the '
+            f'erasure-coded pool with '
+            f'"ceph osd pool set {pool} allow_ec_optimizations true" '
+            f'(requires all OSDs to be running Umbrella or later; '
+            f'Crimson-backed EC pools do not support OMAP).'
+        )
+
     def _add_daemon(self,
                     daemon_type: str,
                     spec: ServiceSpec) -> List[str]:
@@ -3936,9 +4049,16 @@ Then run the following:
             )
             daemons.append(sd)
 
+        # Config generation historically uses the persisted service definition.
+        # The spec passed to daemon-add may contain only placement information, so
+        # keep using it for daemon placement/construction but pass the stored spec
+        # to prepare_create() for config and dependency generation.
+        service_spec = self.spec_store[spec.service_name()].spec
+
         @forall_hosts
-        def create_func_map(*args: Any) -> str:
-            daemon_spec = service_registry.get_service(daemon_type).prepare_create(*args)
+        def create_func_map(daemon_spec: CephadmDaemonDeploySpec) -> str:
+            daemon_spec = service_registry.get_service(daemon_type).prepare_create(
+                DaemonDeployContext(daemon_spec, service_spec))
             with self.async_timeout_handler(daemon_spec.host, f'cephadm deploy ({daemon_spec.daemon_type} daemon)'):
                 return self.wait_async(CephadmServe(self)._create_daemon(daemon_spec))
 
@@ -4383,6 +4503,7 @@ Then run the following:
             return self._add_host(cast(HostSpec, spec))
 
         if spec.service_type == 'osd':
+            self.osd_service.validate_encryption(cast(DriveGroupSpec, spec))
             # _trigger preview refresh needs to be smart and
             # should only refresh if a change has been detected
             self._trigger_preview_refresh(specs=[cast(DriveGroupSpec, spec)])
@@ -4564,7 +4685,7 @@ Then run the following:
         return {
             'service_name': spec.service_name(),
             'service_type': spec.service_type,
-            'add': [hs.hostname for hs in to_add],
+            'add': [f'{spec.service_name()}.{hs.hostname}' for hs in to_add],
             'remove': [d.name() for d in to_remove]
         }
 
@@ -4760,6 +4881,7 @@ Then run the following:
                 'alloy': PlacementSpec(host_pattern='*'),
                 'crash': PlacementSpec(host_pattern='*'),
                 'container': PlacementSpec(count=1),
+                'pushgateway': PlacementSpec(count=1),
                 'snmp-gateway': PlacementSpec(count=1),
                 'mgmt-gateway': PlacementSpec(count=1),
                 'oauth2-proxy': PlacementSpec(count=1),
@@ -4791,6 +4913,7 @@ Then run the following:
                 NvmeofMetadataPoolHelper(self).create_pool_if_needed()
             try:
                 self._check_pool_exists(nvmeof_spec.pool, nvmeof_spec.service_name())
+                self._check_pool_supports_omap(nvmeof_spec.pool, nvmeof_spec.service_name())
             except OrchestratorError as e:
                 self.log.debug(f"{e}")
                 raise
@@ -4925,6 +5048,10 @@ Then run the following:
         return self._apply(spec)
 
     @handle_orch_error
+    def apply_pushgateway(self, spec: ServiceSpec) -> str:
+        return self._apply(spec)
+
+    @handle_orch_error
     def apply_node_exporter(self, spec: ServiceSpec) -> str:
         return self._apply(spec)
 
@@ -4991,6 +5118,11 @@ Then run the following:
         version_error = self.upgrade._check_target_version(ceph_image_version)
         if version_error:
             return f'Incompatible upgrade: {version_error}'
+        isa_errors = self.upgrade.check_host_cpu_isa_level(ceph_image_version)
+        if isa_errors:
+            return ('Incompatible upgrade: found host(s) with a CPU that '
+                    f'cannot run ceph version {ceph_image_version}:\n'
+                    + '\n'.join(self.upgrade._host_cpu_isa_error_detail(isa_errors)))
 
         self.log.debug(f'image info {image} -> {image_info}')
         r: dict = {

@@ -42,7 +42,9 @@ from ceph.deployment.hostspec import (
 from ceph.deployment.utils import unwrap_ipv6, valid_addr, verify_non_negative_int
 from ceph.deployment.utils import verify_positive_int, verify_non_negative_number
 from ceph.deployment.utils import verify_boolean, verify_enum, verify_int, verify_non_empty_string
-from ceph.deployment.utils import verify_size_with_units, validate_port, validate_unique_ports
+from ceph.deployment.utils import verify_size_with_units, validate_port, validate_unique_ports, \
+    validate_ip
+from ceph.deployment.utils import verify_dir_path
 from ceph.cephadm.d3n_types import D3NCacheSpec, D3NCacheError
 from ceph.utils import is_hex
 from ceph.smb import constants as smbconst
@@ -876,6 +878,7 @@ class ServiceSpec(object):
         'osd',
         'prometheus',
         'promtail',
+        'pushgateway',
         'alloy',
         'rbd-mirror',
         'rgw',
@@ -917,6 +920,7 @@ class ServiceSpec(object):
         'alertmanager': {'user_cert_allowed': False, 'scope': 'host', 'requires_ca_cert': False},
         'ceph-exporter': {'user_cert_allowed': False, 'scope': 'host', 'requires_ca_cert': False},
         'node-exporter': {'user_cert_allowed': False, 'scope': 'host', 'requires_ca_cert': False},
+        'pushgateway': {'user_cert_allowed': False, 'scope': 'host', 'requires_ca_cert': False},
         'node-proxy': {'user_cert_allowed': False, 'scope': 'host', 'requires_ca_cert': False},
         # 'loki'        : {'user_cert_allowed': False, 'scope': 'host'},
         # 'promtail'    : {'user_cert_allowed': False, 'scope': 'host'},
@@ -951,6 +955,7 @@ class ServiceSpec(object):
             'loki': MonitoringSpec,
             'promtail': MonitoringSpec,
             'alloy': MonitoringSpec,
+            'pushgateway': MonitoringSpec,
             'snmp-gateway': SNMPGatewaySpec,
             'elasticsearch': TracingSpec,
             'jaeger-agent': TracingSpec,
@@ -1415,6 +1420,10 @@ class NFSServiceSpec(ServiceSpec):
                  custom_configs: Optional[List[CustomConfig]] = None,
                  cluster_qos_config: Optional[Dict[str, Union[str, bool, int]]] = None,
                  cluster_qos_port: Optional[int] = None,
+                 kmip_cert: Optional[str] = None,
+                 kmip_key: Optional[str] = None,
+                 kmip_ca_cert: Optional[str] = None,
+                 kmip_host_list: Optional[List[Union[str, Dict[str, Union[str, int]]]]] = None,
                  ssl: bool = False,
                  ssl_cert: Optional[str] = None,
                  ssl_key: Optional[str] = None,
@@ -1427,9 +1436,14 @@ class NFSServiceSpec(ServiceSpec):
                  tls_ciphers: Optional[str] = None,
                  colocation_ports: Optional[List[Dict[str, int]]] = None,
                  enable_nfsv3: bool = False,
+                 enable_nfs_metrics: bool = False,
                  enable_client_object_cache: bool = False,
                  client_object_cache_size: Optional[Union[str, int]] = None,
                  client_object_cache_max_dirty: Optional[Union[str, int]] = None,
+                 enable_cephfs_client_log: bool = False,
+                 cephfs_client_log_level: Optional[int] = None,
+                 cephfs_client_log_dir: Optional[str] = None,
+                 mem_stats_disable: bool = False,
                  ):
         assert service_type == 'nfs'
         super(NFSServiceSpec, self).__init__(
@@ -1459,6 +1473,7 @@ class NFSServiceSpec(ServiceSpec):
         self.cluster_qos_config = cluster_qos_config
         self.cluster_qos_port = cluster_qos_port
         self.enable_nfsv3 = enable_nfsv3
+        self.enable_nfs_metrics = enable_nfs_metrics
 
         # Ceph client object cache settings written to ganesha.conf CEPH block.
         # Disabled by default; enabling it increases Ganesha memory use.
@@ -1467,11 +1482,36 @@ class NFSServiceSpec(ServiceSpec):
         self.client_object_cache_size = client_object_cache_size
         self.client_object_cache_max_dirty = client_object_cache_max_dirty
 
+        self.enable_cephfs_client_log = enable_cephfs_client_log
+        self.cephfs_client_log_level = cephfs_client_log_level
+        self.cephfs_client_log_dir = cephfs_client_log_dir
+        # Disables per-component memory-statistics capture in NFS_CORE_PARAM.
+        # Applied at daemon startup only; requires daemon restart to take effect.
+        self.mem_stats_disable = mem_stats_disable
+
         # colocation_ports is a list of port dicts for ADDITIONAL colocated daemons
         # The first daemon always uses port and monitoring_port from the spec
         # Format: [{'data_port': 1234, 'monitoring_port': 5678}, ...]
         self.colocation_ports = colocation_ports
 
+        self.kmip_cert = kmip_cert
+        self.kmip_key = kmip_key
+        self.kmip_ca_cert = kmip_ca_cert
+        self.kmip_host_list: list[Dict[str, Union[str, int]]] = []
+        if kmip_host_list is not None:
+            if not isinstance(kmip_host_list, list):
+                raise SpecValidationError(
+                    f'kmip_host_list must be a list, got: {kmip_host_list}.'
+                )
+            for host_obj in kmip_host_list:
+                if isinstance(host_obj, str):
+                    self.kmip_host_list.append({'addr': host_obj})
+                elif isinstance(host_obj, dict):
+                    self.kmip_host_list.append(host_obj)
+                else:
+                    raise SpecValidationError(
+                        f'kmip_host_list contains an invalid element: {host_obj}.'
+                    )
         # TLS fields
         self.tls_ciphers = tls_ciphers
         self.tls_ktls = tls_ktls
@@ -1556,8 +1596,34 @@ class NFSServiceSpec(ServiceSpec):
         if self.virtual_ip and (self.ip_addrs or self.networks):
             raise SpecValidationError("Invalid NFS spec: Cannot set virtual_ip and "
                                       f"{'ip_addrs' if self.ip_addrs else 'networks'} fields")
+        kmip_field_names = [
+            'kmip_cert',
+            'kmip_key',
+            'kmip_ca_cert',
+            'kmip_host_list'
+        ]
+        kmip_fields = [getattr(self, kmip_field) for kmip_field in kmip_field_names]
+        if any(kmip_fields) and not all(kmip_fields):
+            raise SpecValidationError(
+                f'Either none or all of {kmip_field_names} attributes must be set'
+            )
+        for kmip_host in self.kmip_host_list:
+            if 'addr' not in kmip_host:
+                raise SpecValidationError(
+                    "Each dictionary in kmip_host_list must include the 'addr' key."
+                    f"{kmip_host} is missing 'addr'."
+                )
+            if 'port' in kmip_host:
+                port = kmip_host['port']
+                # bool is a subclass of int, so reject it explicitly
+                if isinstance(port, bool) or not isinstance(port, int):
+                    raise SpecValidationError(
+                        f'Provided port is not valid for {kmip_host} in kmip_host_list.'
+                    )
+                validate_port(port, f'port for {kmip_host} in kmip_host_list')
 
         verify_boolean(self.enable_client_object_cache, "enable_client_object_cache")
+        verify_boolean(self.mem_stats_disable, "mem_stats_disable")
         cache_size = verify_size_with_units(
             self.client_object_cache_size, "client_object_cache_size"
         )
@@ -1613,6 +1679,12 @@ class NFSServiceSpec(ServiceSpec):
                 if key.endswith('iops') and not isinstance(value, int):
                     raise SpecValidationError(
                         f"Invalid NFS spec: IOPS '{key}' should be an integer")
+
+        if self.enable_cephfs_client_log:
+            if self.cephfs_client_log_level is not None:
+                verify_non_negative_int(
+                    self.cephfs_client_log_level, "cephfs_client_log_level")
+            verify_dir_path(self.cephfs_client_log_dir, "cephfs_client_log_dir")
 
         # TLS certificate validation
         if self.ssl and not self.certificate_source:
@@ -1905,6 +1977,8 @@ class NvmeofServiceSpec(ServiceSpec):
                  port: Optional[int] = None,
                  pool: Optional[str] = None,
                  enable_auth: bool = False,
+                 enable_encryption: bool = False,
+                 encryption_key_path: Optional[str] = None,
                  ssl: Optional[bool] = False,
                  certificate_source: Optional[str] = None,
                  custom_sans: Optional[List[str]] = None,
@@ -1940,6 +2014,7 @@ class NvmeofServiceSpec(ServiceSpec):
                  verify_nqns: Optional[bool] = True,
                  verify_keys: Optional[bool] = True,
                  verify_listener_ip: Optional[bool] = True,
+                 listener_network_masks: Optional[List[str]] = None,
                  allowed_consecutive_spdk_ping_failures: Optional[int] = 1,
                  spdk_ping_interval_in_seconds: Optional[float] = 2.0,
                  ping_spdk_under_lock: Optional[bool] = False,
@@ -1955,6 +2030,11 @@ class NvmeofServiceSpec(ServiceSpec):
                  max_message_length_in_mb: Optional[int] = 4,
                  io_stats_enabled: Optional[bool] = True,
                  degrade_namespace_on_kmip_error: Optional[bool] = True,
+                 fail_io_for_degraded_namespace: Optional[bool] = True,
+                 resize_degraded_namespace: Optional[bool] = True,
+                 verify_image_encryption_settings: Optional[bool] = True,
+                 verify_pool_applications: Optional[bool] = True,
+                 allowed_pool_applications: Optional[List[str]] = [],
                  server_key: Optional[str] = None,
                  server_cert: Optional[str] = None,
                  client_key: Optional[str] = None,
@@ -2040,6 +2120,13 @@ class NvmeofServiceSpec(ServiceSpec):
         self.group = group or ''
         #: ``enable_auth`` enables user authentication on nvmeof gateway
         self.enable_auth = enable_auth
+
+        #: ``enable_encryption`` enables encryption for the NVMe-oF gateway
+        self.enable_encryption = enable_encryption
+
+        #: ``encryption_key_path`` is the absolute host-side path to an externally
+        #: managed encryption key file used when ``enable_encryption`` is enabled
+        self.encryption_key_path = encryption_key_path
         self.ssl = ssl or enable_auth  # to force enabling ssl field when auth is enabled
         #: ``state_update_notify`` enables automatic update from OMAP in nvmeof gateway
         self.state_update_notify = state_update_notify
@@ -2078,6 +2165,8 @@ class NvmeofServiceSpec(ServiceSpec):
         self.verify_keys = verify_keys
         #: ``verify_listener_ip`` enables verification of listener IP address
         self.verify_listener_ip = verify_listener_ip
+        #: ``listener_network_masks`` subnets for subsystems using use_conf_listener_network_masks
+        self.listener_network_masks = listener_network_masks
         #: ``abort_on_errors`` abort gateway in case of errors
         self.abort_on_errors = abort_on_errors
         #: ``abort_on_update_error`` abort gateway in case of an error during update
@@ -2120,6 +2209,16 @@ class NvmeofServiceSpec(ServiceSpec):
         self.io_stats_enabled = io_stats_enabled
         #: ``degrade_namespace_on_kmip_error`` on a KMIP key error in update, create a degraded ns
         self.degrade_namespace_on_kmip_error = degrade_namespace_on_kmip_error
+        #: ``fail_io_for_degraded_namespace`` fail all IOs done on degraded namespaces
+        self.fail_io_for_degraded_namespace = fail_io_for_degraded_namespace
+        #: ``resize_degraded_namespace`` resize degraded ns to accommodate for encryption tables
+        self.resize_degraded_namespace = resize_degraded_namespace
+        #: ``verify_image_encryption_settings`` verify encryption setting of ns before calling SPDK
+        self.verify_image_encryption_settings = verify_image_encryption_settings
+        #: ``verify_pool_applications`` verify pool only has allowed applications enabled
+        self.verify_pool_applications = verify_pool_applications
+        #: ``allowed_pool_applications`` allowed applications on pool
+        self.allowed_pool_applications = allowed_pool_applications
         #: ``allowed_consecutive_spdk_ping_failures`` # of ping failures before aborting gateway
         self.allowed_consecutive_spdk_ping_failures = allowed_consecutive_spdk_ping_failures
         #: ``spdk_ping_interval_in_seconds`` sleep interval in seconds between SPDK pings
@@ -2301,6 +2400,27 @@ class NvmeofServiceSpec(ServiceSpec):
             raise SpecValidationError('Cannot add NVMEOF: No Pool specified')
 
         verify_boolean(self.enable_auth, "Enable authentication")
+        verify_boolean(self.enable_encryption, "Enable encryption")
+
+        if self.encryption_key and self.encryption_key_path:
+            raise SpecValidationError(
+                'encryption_key and encryption_key_path cannot both be set'
+            )
+
+        if self.enable_encryption:
+            if not self.encryption_key_path and not self.encryption_key:
+                raise SpecValidationError(
+                    'enable_encryption=true requires either encryption_key_path or encryption_key'
+                )
+            if self.encryption_key_path and not self.encryption_key_path.startswith('/'):
+                raise SpecValidationError(
+                    'encryption_key_path must be an absolute path'
+                )
+        elif self.encryption_key_path:
+            raise SpecValidationError(
+                'encryption_key_path requires enable_encryption=true'
+            )
+
         if self.enable_auth or self.ssl:
             if self.certificate_source == CertificateSource.INLINE.value:
                 if not all([self.server_key, self.server_cert, self.client_key,
@@ -2382,6 +2502,12 @@ class NvmeofServiceSpec(ServiceSpec):
         verify_positive_int(self.max_message_length_in_mb, "Max protocol message length")
         verify_boolean(self.io_stats_enabled, "Enable IO statistics")
         verify_boolean(self.degrade_namespace_on_kmip_error, "Degrade namespace on KMIP error")
+        verify_boolean(self.fail_io_for_degraded_namespace, "Fail IOs on degraded namespaces")
+        verify_boolean(self.resize_degraded_namespace,
+                       "Resize degraded namespaces to accommodate for encryption tables")
+        verify_boolean(self.verify_image_encryption_settings,
+                       "Verify namespace encryption settings in the gateway")
+        verify_boolean(self.verify_pool_applications, "Verify pool applications")
         verify_non_negative_number(self.monitor_timeout, "Monitor timeout")
         verify_non_negative_int(self.port, "Port")
         verify_non_negative_int(self.discovery_port, "Discovery port")
@@ -2402,6 +2528,12 @@ class NvmeofServiceSpec(ServiceSpec):
         verify_boolean(self.verify_nqns, "Verify NQNs")
         verify_boolean(self.verify_keys, "Verify Keys")
         verify_boolean(self.verify_listener_ip, "Verify listener IP address")
+        for subnet in (self.listener_network_masks or []):
+            try:
+                ip_network(subnet, strict=False)
+            except ValueError:
+                raise SpecValidationError(
+                    f'Invalid listener_network_masks: "{subnet}"')
         verify_boolean(self.log_files_enabled, "Log files enabled")
         verify_boolean(self.log_files_rotation_enabled, "Log files rotation enabled")
         verify_boolean(self.verbose_log_messages, "Verbose log messages")
@@ -2541,6 +2673,8 @@ class IngressSpec(ServiceSpec):
                  monitor_ip_addrs: Optional[Dict[str, str]] = None,
                  use_tcp_mode_over_rgw: bool = False,
                  haproxy_peer_communication_port: Optional[int] = None,
+                 haproxy_log_target: Optional[str] = 'journald',
+                 haproxy_log_level: Optional[str] = 'info',
                  ):
         assert service_type == 'ingress'
 
@@ -2587,6 +2721,20 @@ class IngressSpec(ServiceSpec):
         self.monitor_ip_addrs = monitor_ip_addrs
         self.use_tcp_mode_over_rgw = use_tcp_mode_over_rgw
         self.haproxy_peer_communication_port = haproxy_peer_communication_port
+        self.haproxy_log_target = self._normalize_log_option(
+            haproxy_log_target, 'journald', 'haproxy_log_target')
+        self.haproxy_log_level = self._normalize_log_option(
+            haproxy_log_level, 'info', 'haproxy_log_level')
+
+    @staticmethod
+    def _normalize_log_option(value: Any, default: str, field_name: str) -> str:
+        # Apply the default only when the value is unset (None, or an empty or
+        # whitespace-only string). A non-string value is a user error.
+        if value is None:
+            return default
+        if not isinstance(value, str):
+            raise SpecValidationError(f'{field_name} must be a string')
+        return value.strip().lower() or default
 
     def get_port_start(self) -> List[int]:
         ports = []
@@ -2657,6 +2805,10 @@ class IngressSpec(ServiceSpec):
                     'To enable monitor_ssl, both monitor_ssl_cert and monitor_ssl_key '
                     'must be provided.'
                 )
+
+        verify_enum(self.haproxy_log_target, 'haproxy_log_target', ['journald', 'none'])
+        verify_enum(self.haproxy_log_level, 'haproxy_log_level',
+                    ['debug', 'info', 'notice', 'warning', 'err'])
 
 
 yaml.add_representer(IngressSpec, ServiceSpec.yaml_representer)
@@ -2748,6 +2900,7 @@ class MgmtGatewaySpec(ServiceSpec):
     def validate(self) -> None:
         super(MgmtGatewaySpec, self).validate()
         validate_port(self.port, 'port')
+        validate_ip(self.virtual_ip)
         self._validate_certificate(self.ssl_cert, "ssl_cert")
         self._validate_private_key(self.ssl_key, "ssl_key")
         self._validate_boolean_switch(self.ssl_prefer_server_ciphers, "ssl_prefer_server_ciphers")
@@ -3171,6 +3324,9 @@ class CustomContainerSpec(ServiceSpec):
             data['spec']['init_containers'] = [ic.to_json() for ic in ics]
         return data
 
+    def get_port_start(self) -> List[int]:
+        return list(self.ports) if self.ports else []
+
 
 yaml.add_representer(CustomContainerSpec, ServiceSpec.yaml_representer)
 
@@ -3195,7 +3351,7 @@ class MonitoringSpec(ServiceSpec):
                  custom_configs: Optional[List[CustomConfig]] = None,
                  ):
         assert service_type in ['grafana', 'node-exporter', 'prometheus', 'alertmanager',
-                                'loki', 'alloy', 'promtail']
+                                'loki', 'alloy', 'promtail', 'pushgateway']
 
         super(MonitoringSpec, self).__init__(
             service_type, service_id,
@@ -3224,7 +3380,8 @@ class MonitoringSpec(ServiceSpec):
                     'grafana': 3000,
                     'loki': 3100,
                     'alloy': 9080,
-                    'promtail': 9080}[self.service_type]
+                    'promtail': 9080,
+                    'pushgateway': 9091}[self.service_type]
 
 
 yaml.add_representer(MonitoringSpec, ServiceSpec.yaml_representer)

@@ -821,8 +821,10 @@ class FilesystemBase(MDSClusterBase):
             if max_mds > 1:
                 self.set_max_mds(max_mds)
 
-            standby_replay = self.fs_config.get('standby_replay', False)
-            self.set_allow_standby_replay(standby_replay)
+            # A new fs has standby-replay disabled; only touch it when asked
+            # to, so a value passed via `fs new ... set` is not overridden.
+            if 'standby_replay' in self.fs_config:
+                self.set_allow_standby_replay(self.fs_config['standby_replay'])
 
             # If absent will use the default value (60 seconds)
             session_timeout = self.fs_config.get('session_timeout', 60)
@@ -1394,6 +1396,40 @@ class FilesystemBase(MDSClusterBase):
 
         kwargs.pop('status', None) # not useful
         return self.json_asok(list(args), 'mds', mds_id, **kwargs)
+
+    def quarantine_enable(self, path, mds_id=None):
+        """Enable quarantine on the given subvolume root path.
+
+        Returns the parsed JSON result dict with keys:
+            return_code (int), operation (str), status (str), error (str, on failure)
+
+        Raises RuntimeError if the command fails.
+        """
+        try:
+            result = self.mds_asok(["quarantine", "enable", path], mds_id=mds_id)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Quarantine enable failed (non-JSON response): {e}")
+        if (result is None or result.get("status") != "successful" or
+                result.get("return_code", 0) != 0):
+            raise RuntimeError(f"Quarantine enable failed: {result}")
+        return result
+
+    def quarantine_disable(self, path, mds_id=None):
+        """Disable quarantine on the given subvolume root path.
+
+        Returns the parsed JSON result dict with keys:
+            return_code (int), operation (str), status (str), error (str, on failure)
+
+        Raises RuntimeError if the command fails.
+        """
+        try:
+            result = self.mds_asok(["quarantine", "disable", path], mds_id=mds_id)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Quarantine disable failed (non-JSON response): {e}")
+        if (result is None or result.get("status") != "successful" or
+                result.get("return_code", 0) != 0):
+            raise RuntimeError(f"Quarantine disable failed: {result}")
+        return result
 
     def mds_tell(self, *args, mds_id=None, **kwargs):
         if mds_id is None:

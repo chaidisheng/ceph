@@ -93,6 +93,16 @@ class OrchestratorValidationError(OrchestratorError):
     """
 
 
+# Keys a node-proxy report must have to be usable.
+NODE_PROXY_REPORT_KEYS = ('host', 'sn', 'status')
+
+
+class HardwareNoReport(OrchestratorError):
+    """
+    Raised when a host has no node-proxy data (unknown host or node-proxy not running).
+    """
+
+
 @contextmanager
 def set_exception_subject(kind: str, subject: str, overwrite: bool = False) -> Iterator[None]:
     try:
@@ -349,6 +359,10 @@ class Orchestrator(object):
         :param category: category
         :param hostname: hostname
         """
+        raise NotImplementedError()
+
+    def node_proxy_list_hosts(self) -> OrchResult[List[str]]:
+        """Return hostnames that have reported node-proxy data."""
         raise NotImplementedError()
 
     def node_proxy_summary(self, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
@@ -642,6 +656,7 @@ class Orchestrator(object):
             'loki': self.apply_loki,
             'promtail': self.apply_promtail,
             'alloy': self.apply_alloy,
+            'pushgateway': self.apply_pushgateway,
             'rbd-mirror': self.apply_rbd_mirror,
             'rgw': self.apply_rgw,
             'ingress': self.apply_ingress,
@@ -905,6 +920,10 @@ class Orchestrator(object):
         """Update existing a alloy daemon(s)"""
         raise NotImplementedError()
 
+    def apply_pushgateway(self, spec: ServiceSpec) -> OrchResult[str]:
+        """Update existing a pushgateway daemon(s)"""
+        raise NotImplementedError()
+
     def apply_crash(self, spec: ServiceSpec) -> OrchResult[str]:
         """Update existing a crash daemon(s)"""
         raise NotImplementedError()
@@ -1037,6 +1056,7 @@ def daemon_type_to_service(dtype: str) -> str:
         'loki': 'loki',
         'promtail': 'promtail',
         'alloy': 'alloy',
+        'pushgateway': 'pushgateway',
         'crash': 'crash',
         'crashcollector': 'crash',  # Specific Rook Daemon
         'container': 'container',
@@ -1073,6 +1093,7 @@ def service_to_daemon_types(stype: str) -> List[str]:
         'loki': ['loki'],
         'promtail': ['promtail'],
         'alloy': ['alloy'],
+        'pushgateway': ['pushgateway'],
         'node-exporter': ['node-exporter'],
         'ceph-exporter': ['ceph-exporter'],
         'crash': ['crash'],

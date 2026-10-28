@@ -42,6 +42,7 @@ extern "C" {
     fn rgw_test_env_dpp() -> *const CRgwDoutPrefix;
     fn rgw_test_env_backend() -> *const c_char;
     fn rgw_test_env_create_bucket(name: *const c_char, tenant: *const c_char) -> c_int;
+    fn rgw_test_env_create_vector_bucket(name: *const c_char, tenant: *const c_char) -> c_int;
     fn rgw_test_env_remove_bucket(name: *const c_char, tenant: *const c_char) -> c_int;
 }
 
@@ -86,13 +87,18 @@ fn sal_env() -> &'static SalEnv {
 }
 
 /// A bucket owned by a single test and removed when the test finishes.
+///
+/// A bucket can be an ordinary S3 bucket or a vector bucket (a S3 bucket in
+/// a separate metadata namespace that holds its LanceDB data inside itself). The
+/// `dual_mode_test!` macro runs each test against both so the FFI/wrapper S3
+/// and vector-bucket paths are exercised identically.
 struct TestBucket {
     name: CString,
     store: RGWObjectStore,
 }
 
 impl TestBucket {
-    fn new(tag: &str) -> Self {
+    fn new(tag: &str, use_vector_bucket: bool) -> Self {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let env = sal_env();
 
@@ -109,11 +115,18 @@ impl TestBucket {
         ))
         .unwrap();
 
-        let ret = unsafe { rgw_test_env_create_bucket(name.as_ptr(), std::ptr::null()) };
+        let ret = unsafe {
+            if use_vector_bucket {
+                rgw_test_env_create_vector_bucket(name.as_ptr(), std::ptr::null())
+            } else {
+                rgw_test_env_create_bucket(name.as_ptr(), std::ptr::null())
+            }
+        };
         assert_eq!(
             ret,
             0,
-            "failed to create bucket {}: {ret}",
+            "failed to create {} bucket {}: {ret}",
+            if use_vector_bucket { "vector" } else { "s3" },
             name.to_string_lossy()
         );
 
@@ -126,6 +139,7 @@ impl TestBucket {
                 name.to_str().unwrap(),
                 "", // tenant
                 "", // prefix
+                use_vector_bucket,
             )
         };
         Self { name, store }
@@ -144,6 +158,35 @@ impl Drop for TestBucket {
     }
 }
 
+/// Define a test that runs against both a S3 bucket and a vector bucket.
+///
+/// Expands to a module named after the test containing two `#[tokio::test]`s,
+/// `s3` and `vector`, each running `$body` with `$b` bound to a freshly
+/// created `TestBucket` of that type. Test IDs become e.g.
+/// `aros_put_get_delete_list::s3` and `aros_put_get_delete_list::vector`.
+macro_rules! dual_mode_test {
+    ($name:ident, |$b:ident| $body:block) => {
+        mod $name {
+            use super::*;
+
+            async fn run($b: TestBucket) $body
+
+            #[tokio::test]
+            async fn s3() {
+                run(TestBucket::new(concat!(stringify!($name), "-s3"), false)).await;
+            }
+
+            #[tokio::test]
+            async fn vector() {
+                if sal_env().backend != "rados" {
+                    return; // vector buckets are currently supported only by RADOS
+                }
+                run(TestBucket::new(concat!(stringify!($name), "-vec"), true)).await;
+            }
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 // arrow-rs object-store conformance suite
 //
@@ -152,73 +195,107 @@ impl Drop for TestBucket {
 //
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn aros_put_get_delete_list() {
-    let b = TestBucket::new("put-get-delete-list");
+dual_mode_test!(aros_put_get_delete_list, |b| {
     integration::put_get_delete_list(b.store()).await;
-}
+});
 
-#[tokio::test]
-async fn aros_get_nonexistent_object() {
-    let b = TestBucket::new("get-nonexistent");
+dual_mode_test!(aros_get_nonexistent_object, |b| {
     let _ = integration::get_nonexistent_object(b.store(), None).await;
-}
+});
 
-#[tokio::test]
-async fn aros_list_uses_directories_correctly() {
-    let b = TestBucket::new("list-uses-directories");
+dual_mode_test!(aros_list_uses_directories_correctly, |b| {
     integration::list_uses_directories_correctly(b.store()).await;
-}
+});
 
-#[tokio::test]
-async fn aros_list_with_delimiter() {
-    let b = TestBucket::new("list-with-delimiter");
+dual_mode_test!(aros_list_with_delimiter, |b| {
     integration::list_with_delimiter(b.store()).await;
-}
+});
 
-#[tokio::test]
-async fn aros_rename_and_copy() {
-    let b = TestBucket::new("rename-and-copy");
+dual_mode_test!(aros_rename_and_copy, |b| {
     integration::rename_and_copy(b.store()).await;
-}
+});
 
-#[tokio::test]
-async fn aros_copy_if_not_exists() {
-    let b = TestBucket::new("copy-if-not-exists");
+dual_mode_test!(aros_copy_if_not_exists, |b| {
     integration::copy_if_not_exists(b.store()).await;
-}
+});
 
-#[tokio::test]
-async fn aros_copy_rename_nonexistent_object() {
-    let b = TestBucket::new("copy-rename-nonexistent");
+dual_mode_test!(aros_copy_rename_nonexistent_object, |b| {
     integration::copy_rename_nonexistent_object(b.store()).await;
-}
+});
 
-#[tokio::test]
-async fn aros_get_opts() {
-    let b = TestBucket::new("get-opts");
+dual_mode_test!(aros_get_opts, |b| {
     integration::get_opts(b.store()).await;
-}
+});
 
-#[tokio::test]
-async fn aros_put_opts() {
-    let b = TestBucket::new("put-opts");
+dual_mode_test!(aros_put_opts, |b| {
     integration::put_opts(b.store(), true).await;
+});
+
+dual_mode_test!(aros_stream_get, |b| {
+    integration::stream_get(b.store()).await;
+});
+
+dual_mode_test!(aros_list_with_offset_exclusivity, |b| {
+    // This test verifies that list_with_offset returns an exclusive list (not including
+    // the offset value itself). It requires PaginatedListStore trait implementation.
+    // RGWObjectStore uses the default list implementation which may have different semantics.
+    integration::list_with_offset_exclusivity(b.store()).await;
+});
+
+dual_mode_test!(aros_multipart_out_of_order, |b| {
+    // This test uploads multipart chunks out of order (e.g., part 2 before part 1),
+    // verifying that the RGW SAL backend accepts out-of-order part uploads as
+    // allowed by the S3 spec.
+    integration::multipart_out_of_order(b.store()).await;
+});
+
+dual_mode_test!(aros_multipart_race_condition, |b| {
+    // This test creates a race condition with 2 threads performing multipart writes
+    // to the same path simultaneously, verifying that RGW SAL handles concurrent
+    // multipart uploads to the same key safely (last writer wins).
+    integration::multipart_race_condition(b.store(), true).await;
+});
+
+dual_mode_test!(aros_put_get_attributes, |b| {
+    // This test verifies reading and writing object Attributes (custom metadata).
+    // RGW user metadata (x-amz-meta-* headers) is exposed through the SAL wrapper
+    // and mapped to the ObjectStore Attributes API.
+    integration::put_get_attributes(b.store()).await;
+});
+
+// ----------------------------------------
+// Skipped arrow-rs integration tests
+// ----------------------------------------
+// The following tests from the arrow-rs integration suite are not currently
+// executed. Each is marked with #[ignore] and includes an explanation.
+
+#[tokio::test]
+#[ignore = "list_paginated requires PaginatedListStore trait which RGWObjectStore does not implement"]
+async fn aros_list_paginated() {
+    // This test requires implementing the PaginatedListStore trait, which provides
+    // more granular control over list pagination. RGWObjectStore currently uses
+    // the default ObjectStore::list implementation which handles pagination internally.
+    // TODO: Evaluate if implementing PaginatedListStore would provide benefits for RGW.
+    // let b = TestBucket::new("list-paginated");
+    // integration::list_paginated(b.store(), b.store()).await;
 }
 
 #[tokio::test]
-async fn aros_stream_get() {
-    let b = TestBucket::new("stream-get");
-    integration::stream_get(b.store()).await;
+#[ignore = "multipart requires MultipartStore trait which RGWObjectStore does not implement"]
+async fn aros_multipart() {
+    // The arrow-rs multipart() test is a comprehensive test of MultipartStore trait.
+    // We have custom multipart tests (multipart_basic, multipart_abort) that provide
+    // equivalent coverage with more explicit control over test scenarios.
+    // This avoids duplication while maintaining test clarity.
+    // let b = TestBucket::new("multipart");
+    // integration::multipart(b.store(), b.store()).await;
 }
 
 // ----------------------------------------
 // Coverage beyond the conformance suite
 // ----------------------------------------
 
-#[tokio::test]
-async fn put_get_binary() {
-    let b = TestBucket::new("put-get-binary");
+dual_mode_test!(put_get_binary, |b| {
     let key = Path::from("binary");
     let data: Vec<u8> = (0..=255u8).collect();
 
@@ -229,17 +306,13 @@ async fn put_get_binary() {
 
     let got = b.store().get(&key).await.unwrap().bytes().await.unwrap();
     assert_eq!(got.as_ref(), data.as_slice());
-}
+});
 
-#[tokio::test]
-async fn delete_non_existent() {
-    let b = TestBucket::new("delete-non-existent");
+dual_mode_test!(delete_non_existent, |b| {
     b.store().delete(&Path::from("already-gone")).await.unwrap();
-}
+});
 
-#[tokio::test]
-async fn delete_then_put() {
-    let b = TestBucket::new("delete-then-put");
+dual_mode_test!(delete_then_put, |b| {
     let key = Path::from("del-reput");
 
     b.store().put(&key, "original".into()).await.unwrap();
@@ -248,11 +321,9 @@ async fn delete_then_put() {
 
     let got = b.store().get(&key).await.unwrap().bytes().await.unwrap();
     assert_eq!(got.as_ref(), b"recreated");
-}
+});
 
-#[tokio::test]
-async fn list_pagination() {
-    let b = TestBucket::new("list-pagination");
+dual_mode_test!(list_pagination, |b| {
     let prefix = Path::from("paginate");
     for i in 0..15 {
         b.store()
@@ -263,11 +334,10 @@ async fn list_pagination() {
 
     let listed = b.store().list(Some(&prefix)).collect::<Vec<_>>().await;
     assert_eq!(listed.into_iter().filter(|r| r.is_ok()).count(), 15);
-}
+});
 
-#[tokio::test]
-async fn multipart_basic() {
-    let b = TestBucket::new("multipart-basic");
+// below additional tests may not be needed once we add support for aros_multipart
+dual_mode_test!(multipart_basic, |b| {
     let key = Path::from("multipart");
     let mut upload = b.store().put_multipart(&key).await.unwrap();
 
@@ -286,11 +356,9 @@ async fn multipart_basic() {
 
     let meta = b.store().head(&key).await.unwrap();
     assert_eq!(meta.size, (part1.len() + part2.len()) as u64);
-}
+});
 
-#[tokio::test]
-async fn multipart_abort() {
-    let b = TestBucket::new("multipart-abort");
+dual_mode_test!(multipart_abort, |b| {
     let key = Path::from("multipart-abort");
     let mut upload = b.store().put_multipart(&key).await.unwrap();
 
@@ -305,4 +373,4 @@ async fn multipart_abort() {
         Err(e) => panic!("expected NotFound, got: {e}"),
         Ok(_) => panic!("object exists after abort"),
     }
-}
+});

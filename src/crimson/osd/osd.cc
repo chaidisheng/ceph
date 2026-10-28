@@ -15,6 +15,7 @@
 
 #include "common/pick_address.h"
 #include "include/util.h"
+#include "include/uuid_fmt.h"
 
 #include "messages/MCommand.h"
 #include "messages/MOSDBeacon.h"
@@ -136,6 +137,7 @@ OSD::OSD(int id, uint32_t nonce,
       std::ignore = update_heartbeat_peers(
       ).then([this] {
 	update_stats();
+	check_debug_levels();
         mgrc->update_daemon_health(get_health_metrics());
 	if (++trim_queue_length_countdown >= TRIM_QLENGTHS_UPDATE_PERIOD) {
 	  trim_queue_length_countdown = 0;
@@ -303,6 +305,30 @@ seastar::future<OSDMeta> OSD::open_or_create_meta_coll(FuturizedStore &store)
   });
 }
 
+namespace {
+
+/// Fail a --mkfs step with a plain error exit rather than an abort.
+///
+/// mkfs is a one-shot tool invocation, and its failures are overwhelmingly
+/// environmental: no space for the backing device files, wrong permissions
+/// on osd_data, a path that is not there. Aborting turns every one of those
+/// into a SIGABRT plus a core dump, which buries the single line that says
+/// what actually went wrong. Throwing instead lets main() report the error
+/// and exit non-zero.
+auto mkfs_step_failed(std::string what)
+{
+  return crimson::stateful_ec::handle(
+    [what = std::move(what)](const std::error_code &ec) {
+      LOG_PREFIX(OSD::mkfs);
+      auto osd_data = local_conf().get_val<std::string>("osd_data");
+      ERROR("{} in {}: {}", what, osd_data, ec.message());
+      return seastar::make_exception_future<>(
+        std::system_error(ec, fmt::format("{} in {}", what, osd_data)));
+    });
+}
+
+}
+
 seastar::future<> OSD::mkfs(
   FuturizedStore &store,
   unsigned whoami,
@@ -314,50 +340,77 @@ seastar::future<> OSD::mkfs(
   DEBUG("starting store mkfs");
   co_await store.start();
 
-  DEBUG("calling store mkfs");
-  co_await store.mkfs(osd_uuid).handle_error(
-    crimson::stateful_ec::assert_failure(fmt::format(
-      "{} error creating empty object store in {}",
-       FNAME, local_conf().get_val<std::string>("osd_data")).c_str())
-  );
+  // Every exit past start() must go through stop(): destroying a started
+  // seastar::sharded<> asserts, which would turn the error exit back into
+  // an abort.
+  bool mounted = false;
+  std::exception_ptr failure;
+  try {
+    DEBUG("calling store mkfs");
+    co_await store.mkfs(osd_uuid).handle_error(
+      mkfs_step_failed("error creating empty object store")
+    );
 
-  DEBUG("mounting store mkfs");
-  co_await store.mount().handle_error(
-    crimson::stateful_ec::assert_failure(fmt::format(
-      "{} error mounting object store in {}",
-      FNAME, local_conf().get_val<std::string>("osd_data")).c_str())
-  );
+    DEBUG("mounting store mkfs");
+    co_await store.mount().handle_error(
+      mkfs_step_failed("error mounting object store")
+    );
+    // set only once the whole mount succeeded, and cleared before umount():
+    // SeaStore::umount() closes every device unconditionally, and closing a
+    // seastar::file that was never opened (or was already closed) dereferences
+    // a null impl. stop() alone is safe after a partial mount or umount; the
+    // destructors close whatever is still open.
+    mounted = true;
 
-  {
-    auto meta_coll = co_await open_or_create_meta_coll(store);
+    {
+      auto meta_coll = co_await open_or_create_meta_coll(store);
 
-    OSDSuperblock superblock;
-    superblock.cluster_fsid = cluster_fsid;
-    superblock.osd_fsid = store.get_fsid();
-    superblock.whoami = whoami;
-    superblock.compat_features = get_osd_initial_compat_set();
-    co_await _write_superblock(
-      store, std::move(meta_coll), std::move(superblock));
+      OSDSuperblock superblock;
+      superblock.cluster_fsid = cluster_fsid;
+      superblock.osd_fsid = store.get_fsid();
+      superblock.whoami = whoami;
+      superblock.compat_features = get_osd_initial_compat_set();
+      co_await _write_superblock(
+        store, std::move(meta_coll), std::move(superblock));
+    }
+
+    co_await store.write_meta("ceph_fsid", cluster_fsid.to_string());
+
+    co_await store.write_meta("magic", CEPH_OSD_ONDISK_MAGIC);
+
+    co_await store.write_meta("whoami", std::to_string(whoami));
+
+    co_await _write_key_meta(store);
+
+    co_await store.write_meta("osdspec_affinity", osdspec_affinity);
+
+    co_await store.write_meta("ready", "ready");
+
+    INFO("created object store {} for osd.{} fsid {}\n",
+         local_conf().get_val<std::string>("osd_data"),
+         whoami, cluster_fsid);
+    mounted = false;
+    co_await store.umount();
+  } catch (...) {
+    failure = std::current_exception();
   }
 
-  co_await store.write_meta("ceph_fsid", cluster_fsid.to_string());
-
-  co_await store.write_meta("magic", CEPH_OSD_ONDISK_MAGIC);
-
-  co_await store.write_meta("whoami", std::to_string(whoami));
-
-  co_await _write_key_meta(store);
-
-  co_await store.write_meta("osdspec_affinity", osdspec_affinity);
-
-  co_await store.write_meta("ready", "ready");
-
-  INFO("created object store {} for osd.{} fsid {}\n",
-       local_conf().get_val<std::string>("osd_data"),
-       whoami, cluster_fsid);
-  co_await store.umount();
-
-  co_await store.stop();
+  if (failure && mounted) {
+    co_await store.umount().handle_exception([FNAME](auto ep) {
+      ERROR("umount after a failed mkfs also failed: {}", ep);
+    });
+  }
+  co_await store.stop().handle_exception([FNAME, failure](auto ep) {
+    if (!failure) {
+      return seastar::make_exception_future<>(ep);
+    }
+    // keep the original error: it is the one the operator needs to see
+    ERROR("stop after a failed mkfs also failed: {}", ep);
+    return seastar::make_ready_future<>();
+  });
+  if (failure) {
+    std::rethrow_exception(failure);
+  }
 }
 
 seastar::future<> OSD::_write_superblock(
@@ -719,6 +772,14 @@ seastar::future<> OSD::_send_boot()
   auto [ret, type] = co_await store.read_meta("type");
   if (ret == 0) {
     m->metadata["osd_objectstore"] = type;
+  }
+  auto data_backend = co_await store.get_data_backend_type_name();
+  if (!data_backend.empty()) {
+    m->metadata["seastore_data_backend"] = data_backend;
+  }
+  auto cache_backend = co_await store.get_cache_backend_type_name();
+  if (!cache_backend.empty()) {
+    m->metadata["seastore_cache_backend"] = cache_backend;
   }
   co_await monc->send_message(std::move(m));
 }
@@ -1107,6 +1168,32 @@ void OSD::handle_conf_change(
   if (changed.contains("osd_beacon_report_interval")) {
     beacon_timer.rearm_periodic(
       std::chrono::seconds(conf->osd_beacon_report_interval));
+  }
+}
+
+void OSD::check_debug_levels()
+{
+  auto threshold = local_conf().get_val<int64_t>(
+    "high_debug_level_threshold");
+  if (threshold <= 0) {
+    return;
+  }
+  auto timeout = local_conf().get_val<std::chrono::seconds>(
+    "high_debug_level_reset_timeout");
+  auto actions = debug_level_guard.check(
+    local_conf()->subsys, threshold, timeout);
+  for (auto& a : actions) {
+    auto val = std::to_string(a.to_log) + "/" + std::to_string(a.to_gather);
+    LOG_PREFIX(OSD::check_debug_levels);
+    ERROR("Auto-reverted {} from {} to {} after {}s",
+	  a.name, a.from_level, val, timeout.count());
+    gate.dispatch_in_background(
+      "debug_level_revert", *this, [name=a.name, val, FNAME] {
+	return local_conf().set_val(name, val).handle_exception(
+	  [name, val, FNAME](auto ep) {
+	    ERROR("failed to revert {} to {}: {}", name, val, ep);
+	  });
+      });
   }
 }
 
@@ -1552,6 +1639,13 @@ vector<DaemonHealthMetric> OSD::get_health_metrics()
     }
     oldest_secs = now - oldest_op->get_started();
     metrics.emplace_back(daemon_metric::SLOW_OPS, slow, oldest_secs);
+  }
+
+  {
+    auto threshold = local_conf().get_val<int64_t>("high_debug_level_threshold");
+    auto [count, max_level] = DebugLevelGuard::count_elevated(
+      local_conf()->subsys, threshold);
+    metrics.emplace_back(daemon_metric::HIGH_DEBUG_LEVEL, count, max_level);
   }
 
   return metrics;

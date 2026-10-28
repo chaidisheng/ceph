@@ -11,12 +11,14 @@ from typing import (
     TypeVar,
     Callable,
     Set,
+    Tuple,
     cast)
 from os.path import normpath
 from ceph.fs.earmarking import EarmarkTopScope
+from ceph.fs.enctag import CephFSVolumeEncryptionTag, EncryptionTagException
 import cephfs
 
-from mgr_util import CephFSEarmarkResolver
+from mgr_util import CephFSEarmarkResolver, open_filesystem
 from rados import TimedOut, ObjectNotFound
 
 from object_format import ErrorResponse
@@ -44,7 +46,9 @@ from .utils import (
     check_fs,
     get_nfs_spec_for_cluster,
     restart_nfs_service,
-    cephfs_path_is_dir)
+    cephfs_client_for_mgr,
+    cephfs_path_is_dir,
+    normalize_auth_entity)
 from .rados_utils import NFSRados
 
 if TYPE_CHECKING:
@@ -84,6 +88,26 @@ def validate_cephfs_path(mgr: 'Module', fs_name: str, path: str) -> None:
         raise NFSObjectNotFound(f"path {path} does not exist")
     except cephfs.Error as e:
         raise NFSException(e.args[1], -e.args[0])
+
+
+def get_enctag_from_path(mgr: 'Module', fs_name: str, path: str) -> Optional[str]:
+    """
+    Retrieve the encryption tag (enctag) from a CephFS path.
+    """
+    try:
+        cephfs_client = cephfs_client_for_mgr(mgr)
+        with open_filesystem(cephfs_client, fs_name) as fs_handle:
+            fs_enctag = CephFSVolumeEncryptionTag(fs_handle, path)
+            enctag = fs_enctag.get_tag()
+            return enctag if enctag else ""
+    except EncryptionTagException as e:
+        log.warning("Failed to get enctag for path %s: %s", path, e)
+        if e.errno == -errno.ENODATA:
+            return ""
+        raise NFSException(f"Failed to get enctag for path {path}: {e.error_str}", e.errno)
+    except Exception as e:
+        log.exception("Unexpected error getting enctag for path %s: %s", path, e)
+        raise NFSException(f"Failed to get enctag for path {path}: {e}", -errno.EIO)
 
 
 def _validate_cmount_path(cmount_path: str, path: str) -> None:
@@ -491,6 +515,64 @@ class ExportMgr:
         export = self._fetch_export(cluster_id, pseudo_path)
         return export.to_dict() if export else None
 
+    def reload_exports(self) -> None:
+        """Drop the cached exports so that they are re-read from RADOS."""
+        self._exports = None
+
+    def get_cephfs_export_user_ids(self, cluster_id: str) -> Set[str]:
+        """Return CephFS export user_ids for the cluster."""
+        return {
+            export.fsal.user_id
+            for export in self.exports.get(cluster_id, [])
+            if isinstance(export.fsal, CephFSFSAL) and export.fsal.user_id
+        }
+
+    def refresh_export_keys(
+            self,
+            cluster_id: str,
+            entities: List[str]
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Re-fetch CephX keys for the given export entities and update matching
+        CephFS exports so Ganesha receives the new keyrings.
+
+        Returns the pseudo paths that were updated and the ones that could not
+        be. One failure must not stop the others: their keys are already
+        rotated, so an export left behind is one Ganesha cannot authenticate.
+        """
+        entity_set = {normalize_auth_entity(e) for e in entities}
+        updated_pseudos: List[str] = []
+        stale_pseudos: List[str] = []
+
+        for export in list(self.exports.get(cluster_id, [])):
+            if not isinstance(export.fsal, CephFSFSAL) or not export.fsal.user_id:
+                continue
+            entity = f'client.{export.fsal.user_id}'
+            if entity not in entity_set:
+                continue
+
+            old_key = export.fsal.cephx_key
+            try:
+                self._ensure_cephfs_export_user(export)
+                if export.fsal.cephx_key == old_key:
+                    log.warning(
+                        "Export %s key for user %s did not change after rotate",
+                        export.pseudo, export.fsal.user_id
+                    )
+                self.exports[cluster_id].remove(export)
+                self._update_export(cluster_id, export, need_nfs_service_restart=False)
+            except Exception:
+                stale_pseudos.append(export.pseudo)
+                log.exception("Failed to update export %s after key rotation", export.pseudo)
+                continue
+
+            updated_pseudos.append(export.pseudo)
+            log.info(
+                "Updated export %s with rotated key for user %s",
+                export.pseudo, export.fsal.user_id
+            )
+        return updated_pseudos, stale_pseudos
+
     # This method is used by the dashboard module (../dashboard/controllers/nfs.py)
     # Do not change interface without updating the Dashboard code
     def apply_export(self, cluster_id: str, export_config: str,
@@ -597,15 +679,17 @@ class ExportMgr:
                 'caps': nfs_caps,
                 'format': 'json',
             })
-            if err:
-                raise NFSException(f'Failed to update caps for {entity}: {err}')
+            if ret:
+                raise NFSException(f'Failed to update caps for {entity}: {err}', ret)
             ret, out, err = self.mgr.mon_command({
                 'prefix': 'auth get',
                 'entity': f'client.{entity}',
                 'format': 'json',
             })
-            if err:
-                raise NFSException(f'Failed to fetch caps for {entity}: {err}')
+            if ret:
+                raise NFSException(f'Failed to fetch caps for {entity}: {err}', ret)
+        elif ret:
+            raise NFSException(f'Failed to create user {entity}: {err}', ret)
 
         json_res = json.loads(out)
         log.info(f"Export user created is {json_res[0]['entity']}")
@@ -633,6 +717,36 @@ class ExportMgr:
                 )
         return None
 
+    def _validate_kmip_key_id_with_enctag(
+        self,
+        kmip_key_id: str,
+        fs_name: Optional[str],
+        path: Optional[str]
+    ) -> None:
+        """
+        Validate that kmip_key_id matches the subvolume's enctag for CephFS exports.
+        """
+        if not fs_name or not path:
+            log.debug(f"Skipping enctag validation for kmip_key_id '{kmip_key_id}': "
+                      f"fs_name={fs_name}, path={path} (likely not a CephFS export)")
+            return
+
+        enctag = get_enctag_from_path(self.mgr, fs_name, path)
+        if not enctag:
+            raise NFSInvalidOperation(
+                f"Cannot create export with kmip_key_id '{kmip_key_id}': "
+                f"subvolume at path '{path}' does not have an enctag set. "
+                "Please set the enctag on the subvolume using "
+                "'ceph fs subvolume enctag set' command."
+            )
+        if enctag != kmip_key_id:
+            raise NFSInvalidOperation(
+                f"Cannot create export: kmip_key_id '{kmip_key_id}' does not match "
+                f"subvolume enctag '{enctag}' at path '{path}'. "
+                "The kmip_key_id must match the enctag set on the subvolume."
+            )
+        log.info(f"Validated kmip_key_id '{kmip_key_id}' matches subvolume enctag at path '{path}'")
+
     def create_export_from_dict(self,
                                 cluster_id: str,
                                 ex_id: int,
@@ -650,9 +764,17 @@ class ExportMgr:
 
         fsal = ex_dict.get("fsal", {})
         fsal_type = fsal.get("name")
+
         if fsal_type == NFS_GANESHA_SUPPORTED_FSALS[1]:
             if '/' in path and path != '/':
                 raise NFSInvalidOperation('"/" is not allowed in path with bucket name')
+
+            # BYOK encryption is only supported by the CEPH FSAL
+            if ex_dict.get("kmip_key_id"):
+                raise NFSInvalidOperation(
+                    "kmip_key_id is only supported for CephFS exports, "
+                    f"not for {NFS_GANESHA_SUPPORTED_FSALS[1]} exports")
+
         elif fsal_type == NFS_GANESHA_SUPPORTED_FSALS[0]:
             fs_name = fsal.get("fs_name")
             if not fs_name:
@@ -661,6 +783,11 @@ class ExportMgr:
                 raise FSNotFound(fs_name)
 
             validate_cephfs_path(self.mgr, fs_name, path)
+
+            # Validate kmip_key_id against subvolume enctag for CephFS
+            kmip_key_id = ex_dict.get("kmip_key_id")
+            if kmip_key_id:
+                self._validate_kmip_key_id_with_enctag(kmip_key_id, fs_name, path)
 
             # Check if earmark is set for the path, given path is of subvolume
             if earmark_resolver:
@@ -707,7 +834,8 @@ class ExportMgr:
                              xprtsec: Optional[str] = None,
                              cmount_path: Optional[str] = "/",
                              transports: Optional[List[str]] = None,
-                             earmark_resolver: Optional[CephFSEarmarkResolver] = None
+                             earmark_resolver: Optional[CephFSEarmarkResolver] = None,
+                             kmip_key_id: Optional[str] = None
                              ) -> Dict[str, Any]:
 
         validate_cephfs_path(self.mgr, fs_name, path)
@@ -732,6 +860,7 @@ class ExportMgr:
             "sectype": sectype,
             "XprtSec": xprtsec,
             "protocols": protocols,
+            "kmip_key_id": kmip_key_id
         }
         if transports is not None:
             export_dict["transports"] = transports
@@ -787,7 +916,7 @@ class ExportMgr:
             "clients": clients,
             "sectype": sectype,
             "XprtSec": xprtsec,
-            "protocols": protocols,
+            "protocols": protocols
         }
         if transports is not None:
             export_dict["transports"] = transports

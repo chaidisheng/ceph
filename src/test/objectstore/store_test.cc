@@ -34,6 +34,9 @@
 #include "os/ObjectStore.h"
 #if defined(WITH_BLUESTORE)
 #include "os/bluestore/BlueStore.h"
+#include "os/bluestore/BlueStore_objects.h"
+#include "os/bluestore/Allocator.h"
+#include "os/bluestore/bluestore_common.h"
 #include "os/bluestore/BlueFS.h"
 #endif
 #include "include/Context.h"
@@ -278,6 +281,7 @@ class MultiLabelTest : public CheckedUmount {
     bdev->close();
     return r;
   }
+  void online_expand_reserves_new_label(const char* allocator);
 };
 
 class CorruptedOnodesTest : public CheckedUmount {
@@ -1887,6 +1891,148 @@ TEST_P(StoreTestSpecificAUSize, ReproBug41901Test) {
   }
 }
 
+TEST_P(StoreTest, InterfacePerfCounters) {
+  if (string(GetParam()) != "bluestore")
+    GTEST_SKIP() << "bluestore-only perf counters";
+
+  const PerfCounters* logger = store->get_perf_counters();
+  auto cnt    = [logger](int idx){ return logger->get_tavg_ns(idx).second; };  // # calls
+  auto sum_ns = [logger](int idx){ return logger->get_tavg_ns(idx).first;  };  // total ns
+
+  // pg, not meta: split/merge_collection assert is_pg() on src and dest.
+  const int bits = 2;
+  coll_t cid(spg_t(pg_t(0, 4373), shard_id_t::NO_SHARD));
+  // hash 0 so get_onode's oid.match() passes; one shared hash keeps _clone valid.
+  ghobject_t oid (hobject_t(sobject_t("obj",  CEPH_NOSNAP), "key", 0, 4373, ""));
+  ghobject_t coid(hobject_t(sobject_t("obj2", CEPH_NOSNAP), "key", 0, 4373, ""));
+  ghobject_t roid(hobject_t(sobject_t("obj3", CEPH_NOSNAP), "key", 0, 4373, ""));
+  ghobject_t miss(hobject_t(sobject_t("missing", CEPH_NOSNAP), "key", 0, 4373, ""));
+  auto ch = store->create_new_collection(cid);
+
+  auto submit = [&](auto&& fn) {
+    ObjectStore::Transaction t; fn(t);
+    ASSERT_EQ(0, queue_transaction(store, ch, std::move(t)));
+  };
+  // run fn, assert the counter advanced by `want`, print avg latency
+  auto check = [&](const char* name, int idx, uint64_t want, auto&& fn) {
+    uint64_t before = cnt(idx);
+    fn();
+    uint64_t after = cnt(idx);
+    double avg_us = after ? (double)sum_ns(idx) / after / 1000.0 : 0.0;
+    std::cout << "  " << name << ": +" << (after - before)
+              << " (expected +" << want << "), avg " << avg_us << " us\n";
+    EXPECT_EQ(before + want, after) << name;
+  };
+
+  // setup: a populated object (data + attr + omap)
+  submit([&](auto& t){
+    t.create_collection(cid, bits);
+    t.touch(cid, oid);
+    bufferlist bl; bl.append(string(4096, 'a'));
+    t.write(cid, oid, 0, bl.length(), bl);
+    bufferlist av; av.append("v");
+    t.setattr(cid, oid, "a", av);
+    map<string,bufferlist> om{{"k", av}};
+    t.omap_setkeys(cid, oid, om);
+  });
+
+  // ---- read side ----
+  check("exists_lat", l_bluestore_exists_lat, 2, [&]{
+    store->exists(ch, miss); store->exists(ch, oid); });
+
+  check("stat_lat", l_bluestore_stat_lat, 2, [&]{
+    struct stat st;
+    store->stat(ch, miss, &st);            // -ENOENT still counts
+    store->stat(ch, oid, &st); });
+
+  check("getattr_lat (getattr+getattrs)", l_bluestore_getattr_lat, 2, [&]{
+    bufferptr bp; store->getattr(ch, oid, "a", bp);
+    std::map<std::string, bufferptr, std::less<>> aset;
+    store->getattrs(ch, oid, aset); });
+
+  check("fiemap_lat", l_bluestore_fiemap_lat, 1, [&]{
+    bufferlist bl; store->fiemap(ch, oid, 0, 4096, bl); });
+
+  check("omap_get_lat (get+header+check_keys)", l_bluestore_omap_get_lat, 3, [&]{
+    bufferlist header; map<string,bufferlist> out;
+    store->omap_get(ch, oid, &header, &out);
+    store->omap_get_header(ch, oid, &header);
+    set<string> keys{"k"}, got;
+    store->omap_check_keys(ch, oid, keys, &got); });
+
+  check("collection_lat (list+exists+bits)", l_bluestore_collection_lat, 3, [&]{
+    vector<coll_t> ls; store->list_collections(ls);
+    store->collection_exists(cid);
+    store->collection_bits(ch); });
+
+  // collection_empty delegates to collection_list (counted as clist_lat), so it
+  // must not bump collection_lat -- guards against double counting.
+  check("collection_empty stays uncounted", l_bluestore_collection_lat, 0, [&]{
+    bool empty; store->collection_empty(ch, &empty); });
+
+  // ---- write side ----
+  check("touch_lat", l_bluestore_touch_lat, 1, [&]{
+    submit([&](auto& t){ t.touch(cid, oid); }); });
+
+  check("zero_lat", l_bluestore_zero_lat, 1, [&]{
+    submit([&](auto& t){ t.zero(cid, oid, 0, 4096); }); });
+
+  check("clone_lat (clone+clone_range)", l_bluestore_clone_lat, 2, [&]{
+    submit([&](auto& t){
+      t.clone(cid, oid, coid);
+      t.clone_range(cid, oid, coid, 0, 4096, 0); }); });
+
+  check("chgattr_lat (setattr+setattrs+rmattr+rmattrs)", l_bluestore_change_attr_lat, 4, [&]{
+    bufferlist v; v.append("x");
+    std::map<std::string, bufferptr, std::less<>> aset{{"b", bufferptr("y", 1)}};
+    submit([&](auto& t){
+      t.setattr(cid, oid, "a", v);
+      t.setattrs(cid, oid, aset);
+      t.rmattr(cid, oid, "a");
+      t.rmattrs(cid, oid); }); });
+
+  check("omap_set_lat (setkeys+setheader+rmkeys+rmkeyrange)", l_bluestore_omap_set_lat, 4, [&]{
+    bufferlist v; v.append("x");
+    map<string,bufferlist> om{{"k1", v}, {"k2", v}};
+    set<string> rm{"k1"};
+    submit([&](auto& t){
+      t.omap_setkeys(cid, oid, om);
+      t.omap_setheader(cid, oid, v);
+      t.omap_rmkeys(cid, oid, rm);
+      t.omap_rmkeyrange(cid, oid, "k2", "k9"); }); });
+
+  check("rename_lat", l_bluestore_rename_lat, 1, [&]{
+    submit([&](auto& t){ t.collection_move_rename(cid, coid, cid, roid); }); });
+
+  check("other_ops_lat (set_alloc_hint)", l_bluestore_other_ops_lat, 1, [&]{
+    submit([&](auto& t){ t.set_alloc_hint(cid, oid, 4096, 4096, 0); }); });
+
+  // ---- collection ops ----
+  // split dest must be fresh, empty, and created at bits+1.
+  coll_t pb(spg_t(pg_t(1 << bits, 4373), shard_id_t::NO_SHARD));
+  store->create_new_collection(pb);
+
+  check("split_collection_lat", l_bluestore_split_collection_lat, 1, [&]{
+    submit([&](auto& t){
+      t.create_collection(pb, bits + 1);
+      t.split_collection(cid, bits + 1, 1 << bits, pb); }); });
+
+  check("merge_collection_lat", l_bluestore_merge_collection_lat, 1, [&]{
+    submit([&](auto& t){ t.merge_collection(pb, cid, bits); }); });
+
+  // merge consumed pb; recreate it empty. _remove_collection calls
+  // flush_all_but_last() on pb's own sequencer, so queue on chb, not ch.
+  check("remove_collection_lat", l_bluestore_remove_collection_lat, 1, [&]{
+    auto chb = store->create_new_collection(pb);
+    {
+      ObjectStore::Transaction t; t.create_collection(pb, bits);
+      ASSERT_EQ(0, queue_transaction(store, chb, std::move(t)));
+    }
+    {
+      ObjectStore::Transaction t; t.remove_collection(pb);
+      ASSERT_EQ(0, queue_transaction(store, chb, std::move(t)));
+    } });
+}
 
 TEST_P(StoreTestSpecificAUSize, BluestoreStatFSTest) {
   if(string(GetParam()) != "bluestore")
@@ -11842,6 +11988,96 @@ TEST_P(MultiLabelTest, UpgradeToMultiLabelCollisionWithObjects) {
   ASSERT_EQ(label.meta["multi"], "yes");
 }
 
+// An online expand (expand_devices() while mounted, i.e.
+// "ceph tell osd.N bluestore bluefs-bdev-expand") writes bdev label copies
+// into the new space; they must not be handed out by the allocator.
+void MultiLabelTest::online_expand_reserves_new_label(const char* allocator) {
+  static constexpr uint64_t _1M = 1024 * 1024;
+  static constexpr uint64_t _1G = 1024 * _1M;
+  SetVal(g_conf(), "bluestore_block_size", stringify(_1G - 64 * _1M).c_str());
+  SetVal(g_conf(), "bluestore_bdev_label_multi", "true");
+  SetVal(g_conf(), "bluestore_allocator", allocator);
+  g_conf().apply_changes(nullptr);
+  DeferredSetup();
+  if (!bdev_supports_label()) {
+    GTEST_SKIP();
+  }
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store.get());
+  ASSERT_NE(nullptr, bstore);
+  string block = get_data_dir() + "/block";
+  ASSERT_EQ(0, ::truncate(block.c_str(), 2 * _1G));
+  {
+    stringstream ss;
+    ASSERT_EQ(0, bstore->expand_devices(ss));
+  }
+  bluestore_bdev_label_t label;
+  ASSERT_EQ(0, BlueStore::read_bdev_label_at_pos(g_ceph_context, block, _1G, &label));
+
+  auto label_free = [&]() {
+    uint64_t bytes = 0;
+    bstore->debug_get_alloc()->foreach([&](uint64_t o, uint64_t l) {
+      uint64_t s = std::max(o, _1G);
+      uint64_t e = std::min(o + l, _1G + BDEV_LABEL_BLOCK_SIZE);
+      if (s < e) {
+        bytes += e - s;
+      }
+    });
+    return bytes;
+  };
+  EXPECT_EQ(0u, label_free()) << "bdev label copy at 1G is free in the allocator";
+
+  // rewriting the labels and remounting must leave label and store consistent
+  ASSERT_EQ(0, bstore->write_meta("online_expand_test", "1"));
+  umount();
+  EXPECT_EQ(0, store->fsck(false));
+  ASSERT_EQ(0, BlueStore::read_bdev_label_at_pos(g_ceph_context, block, _1G, &label));
+  EXPECT_EQ("1", label.meta["online_expand_test"]);
+  ASSERT_EQ(0, mount());
+  EXPECT_EQ(0u, label_free()) << "bdev label copy at 1G is free after remount";
+}
+
+TEST_P(MultiLabelTest, OnlineExpandReservesNewLabelHybrid) {
+  online_expand_reserves_new_label("hybrid");
+}
+
+TEST_P(MultiLabelTest, OnlineExpandReservesNewLabelAvl) {
+  online_expand_reserves_new_label("avl");
+}
+
+TEST_P(MultiLabelTest, OnlineExpandReservesNewLabelBitmap) {
+  online_expand_reserves_new_label("bitmap");
+}
+
+TEST_P(MultiLabelTest, OnlineExpandReservesNewLabelBtree2) {
+  online_expand_reserves_new_label("hybrid_btree2");
+}
+
+// Without multi labels an online expand must not write extra label copies.
+TEST_P(MultiLabelTest, OnlineExpandSingleLabelWritesNoCopy) {
+  static constexpr uint64_t _1M = 1024 * 1024;
+  static constexpr uint64_t _1G = 1024 * _1M;
+  SetVal(g_conf(), "bluestore_block_size", stringify(_1G - 64 * _1M).c_str());
+  SetVal(g_conf(), "bluestore_bdev_label_multi", "false");
+  g_conf().apply_changes(nullptr);
+  DeferredSetup();
+  if (!bdev_supports_label()) {
+    GTEST_SKIP();
+  }
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store.get());
+  ASSERT_NE(nullptr, bstore);
+  string block = get_data_dir() + "/block";
+  ASSERT_EQ(0, ::truncate(block.c_str(), 2 * _1G));
+  {
+    stringstream ss;
+    ASSERT_EQ(0, bstore->expand_devices(ss));
+  }
+  bluestore_bdev_label_t label;
+  EXPECT_NE(0, BlueStore::read_bdev_label_at_pos(g_ceph_context, block, _1G, &label))
+    << "single-label store got a label copy at 1G";
+  ASSERT_EQ(0, BlueStore::read_bdev_label_at_pos(g_ceph_context, block, 0, &label));
+  EXPECT_EQ(2 * _1G, label.size);
+}
+
 TEST_P(CorruptedOnodesTest, Recover_TolerateMissingHeadShard)
 {
   SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
@@ -12673,6 +12909,63 @@ TEST_P(StoreTestSpecificAUSize, BluestoreDBShardingNoAlertTest) {
   int r = store->statfs(&statfs, &alerts);
   ASSERT_EQ(r, 0);
   ASSERT_EQ(alerts.count("BLUESTORE_NO_DB_SHARDING"), 0);
+}
+
+TEST_P(StoreTestSpecificAUSize, BluestoreLegacyMinAllocSizeAlertTest) {
+  if (string(GetParam()) != "bluestore")
+    return;
+
+  // make the expected default allocation unit deterministic
+  // (bluestore_min_alloc_size_ssd = 4 KiB)
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");
+  g_conf().apply_changes(nullptr);
+
+  // deploy an OSD with a 64 KiB allocation unit, as mkfs would have
+  // done on an HDD prior to Pacific
+  StartDeferred(65536);
+
+  struct store_statfs_t statfs;
+  osd_alert_list_t alerts;
+  int r = store->statfs(&statfs, &alerts);
+  ASSERT_EQ(r, 0);
+  // no alert yet: the on-disk value matches the explicitly configured
+  // bluestore_min_alloc_size, hence it is considered deliberate
+  ASSERT_EQ(alerts.count("BLUESTORE_LEGACY_MIN_ALLOC_SIZE"), 0);
+
+  // drop the explicit setting: the on-disk 64 KiB allocation unit is
+  // now larger than the 4 KiB unit a redeployed OSD would get
+  SetVal(g_conf(), "bluestore_min_alloc_size", "0");
+  g_conf().apply_changes(nullptr);
+
+  alerts.clear();
+  r = store->statfs(&statfs, &alerts);
+  ASSERT_EQ(r, 0);
+  ASSERT_EQ(alerts.count("BLUESTORE_LEGACY_MIN_ALLOC_SIZE"), 1);
+  std::cout << "legacy_min_alloc_size_alert:"
+	    << alerts.find("BLUESTORE_LEGACY_MIN_ALLOC_SIZE")->second
+	    << std::endl;
+
+  // the alert can be disabled at runtime
+  SetVal(g_conf(), "bluestore_warn_on_legacy_min_alloc_size", "false");
+  g_conf().apply_changes(nullptr);
+
+  alerts.clear();
+  r = store->statfs(&statfs, &alerts);
+  ASSERT_EQ(r, 0);
+  ASSERT_EQ(alerts.count("BLUESTORE_LEGACY_MIN_ALLOC_SIZE"), 0);
+}
+
+TEST_P(StoreTest, BluestoreDefaultMinAllocSizeNoAlertTest) {
+  if (string(GetParam()) != "bluestore")
+    return;
+
+  // an OSD deployed with the default configuration matches the
+  // allocation unit a newly deployed OSD would use
+  struct store_statfs_t statfs;
+  osd_alert_list_t alerts;
+  int r = store->statfs(&statfs, &alerts);
+  ASSERT_EQ(r, 0);
+  ASSERT_EQ(alerts.count("BLUESTORE_LEGACY_MIN_ALLOC_SIZE"), 0);
 }
 
 TEST_P(StoreTestSpecificAUSize, Ticket45195Repro) {

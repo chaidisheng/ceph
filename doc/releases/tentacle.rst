@@ -4,6 +4,20 @@ Tentacle
 
 Tentacle is the 20th stable release of Ceph.
 
+.. important::
+
+   **Upgrade to the latest minor release of Tentacle.** Upgrades from Squid
+   v19.2.6 to Tentacle releases earlier than v20.2.4 may fail: v20.2.4
+   introduced the key type changes, so Tentacle daemons older than v20.2.4
+   fail to start. The Managers upgrade, the rest may not, and the only way out
+   is to redeploy the Managers with the previous image and start over.
+
+   This is a specific case of a general rule: upgrading to the **latest** minor
+   release of the target series is the only supported and tested path from an
+   older release. A release cannot be tested against releases that did not exist
+   when it shipped -- v19.2.6 postdates v20.2.3, so v19.2.6 to v20.2.3 was never
+   a tested combination.
+
 v20.2.4 Tentacle
 ================
 
@@ -23,13 +37,14 @@ Notable Changes
 * :ref:`CVE-2026-54330` is a flaw in RGW not properly verifying its SigV4 cryptographic signatures in RGW's SigV4 verifier.
 
 
+.. _tentacle-20-2-4-critical-upgrade-steps:
+
 Critical Upgrade Steps
 ----------------------
 
 * Please review the :ref:`CVE-2025-30156-upgrade-steps` on the :ref:`CVE-2025-30156` documentation.
 * Please review the :ref:`CVE-2026-54330-upgrade-steps` on the :ref:`CVE-2026-54330` documentation.
 * Please review the :ref:`CVE-2026-50152-recommendations` on the :ref:`CVE-2026-50152` documentation.
-
 
 Changelog
 ---------
@@ -903,7 +918,8 @@ MGR
 RADOS
 
 * FastEC: Long-anticipated performance and space amplification
-  optimizations are added for erasure-coded pools.
+  optimizations are added for erasure-coded pools. See
+  :ref:`rados_ops_erasure_coding_optimizations`.
 * BlueStore: Improved compression and a new, faster WAL (write-ahead-log).
 * Data Availability Score: Users can now track a data availability score
   for each pool in their cluster.
@@ -1082,7 +1098,9 @@ RADOS
   (RGW), in particular when using smaller sized objects. A new flag
   ``allow_ec_optimizations`` must be set on each pool to switch to using the
   new code. Existing pools can be upgraded once the OSD and Monitor daemons
-  have been updated. There is no need to update the clients.
+  have been updated. There is no need to update the clients. See
+  :ref:`rados_ops_erasure_coding_optimizations` for how to enable
+  optimizations and for tuning guidance.
 
 * The default plugin for erasure coded pools has been changed from Jerasure to
   ISA-L. Clusters created on Tentacle or later releases will use ISA-L as the
@@ -1293,6 +1311,11 @@ Telemetry
 Upgrading from Reef or Squid
 ----------------------------
 
+.. warning::
+
+   Review the :ref:`tentacle-20-2-4-critical-upgrade-steps` before upgrading
+   from Reef or Squid to 20.2.4 or later.
+
 Before starting, ensure that your cluster is stable and healthy with no
 ``down``, ``recovering``, ``incomplete``, ``undersized`` or ``backfilling`` PGs.
 You can temporarily disable the PG autoscaler for all pools during the upgrade
@@ -1303,6 +1326,14 @@ noautoscale`` after upgrade success is confirmed.
 .. note::
 
    You can monitor the progress of your upgrade at each stage with the ``ceph versions`` command, which will tell you what Ceph version(s) are running for each type of daemon.
+
+.. note::
+
+   Upgrade to the latest minor release of Tentacle. Upgrades from Squid v19.2.6
+   to Tentacle releases earlier than v20.2.4 may fail: v20.2.4 introduced the key
+   type changes, so Tentacle daemons older than v20.2.4 fail to start. The
+   Managers upgrade, the rest may not, and the only way out is to redeploy the
+   Managers with the previous image and start over.
 
 Upgrading Cephadm Clusters
 --------------------------

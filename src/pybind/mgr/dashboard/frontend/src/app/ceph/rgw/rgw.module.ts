@@ -16,6 +16,7 @@ import { ActionLabels, URLVerbs } from '~/app/shared/constants/app.constants';
 import { FeatureTogglesGuardService } from '~/app/shared/services/feature-toggles-guard.service';
 import { ModuleStatusGuardService } from '~/app/shared/services/module-status-guard.service';
 
+import { ContextComponent } from '~/app/core/context/context.component';
 import { SharedModule } from '~/app/shared/shared.module';
 import { PerformanceCounterModule } from '../performance-counter/performance-counter.module';
 import { RgwBucketFormComponent } from './rgw-bucket-form/rgw-bucket-form.component';
@@ -57,6 +58,7 @@ import { RgwSyncMetadataInfoComponent } from './rgw-sync-metadata-info/rgw-sync-
 import { RgwSyncDataInfoComponent } from './rgw-sync-data-info/rgw-sync-data-info.component';
 import { BucketTagModalComponent } from './bucket-tag-modal/bucket-tag-modal.component';
 import { NfsFormComponent } from '../nfs/nfs-form/nfs-form.component';
+import { NFS_PAGE_HEADER } from '../nfs/nfs.constants';
 import { RgwMultisiteSyncPolicyComponent } from './rgw-multisite-sync-policy/rgw-multisite-sync-policy.component';
 import { RgwMultisiteSyncPolicyFormComponent } from './rgw-multisite-sync-policy-form/rgw-multisite-sync-policy-form.component';
 import { RgwConfigurationPageComponent } from './rgw-configuration-page/rgw-configuration-page.component';
@@ -130,6 +132,8 @@ import { RgwBucketLifecycleListComponent } from './rgw-bucket-lifecycle-list/rgw
 import { RgwRateLimitComponent } from './rgw-rate-limit/rgw-rate-limit.component';
 import { RgwRateLimitDetailsComponent } from './rgw-rate-limit-details/rgw-rate-limit-details.component';
 import { NfsClusterComponent } from '../nfs/nfs-cluster/nfs-cluster.component';
+import { SmbModule } from '../smb/smb.module';
+import { smbParentRoute } from '../smb/smb.routes';
 import { RgwTopicListComponent } from './rgw-topic-list/rgw-topic-list.component';
 import { RgwTopicResourceSidebarComponent } from './rgw-topic-resource-sidebar/rgw-topic-resource-sidebar.component';
 import { RgwTopicResourcePageComponent } from './rgw-topic-resource-page/rgw-topic-resource-page.component';
@@ -189,7 +193,9 @@ import { RgwBucketTagsTableComponent } from './rgw-bucket-tags-table/rgw-bucket-
     TimePickerComponent,
     AreaChartComponent,
     ComponentsModule,
-    ContentSwitcherModule
+    ContentSwitcherModule,
+    ContextComponent,
+    SmbModule
   ],
   exports: [
     RgwDaemonResourcePageComponent,
@@ -565,10 +571,14 @@ const routes: Routes = [
         section_info: 'NFS GANESHA',
         header: 'NFS-Ganesha is not configured'
       },
-      breadcrumbs: 'NFS'
+      breadcrumbs: $localize`Network Filesystem`
     },
     children: [
-      { path: '', component: NfsClusterComponent },
+      {
+        path: '',
+        component: NfsClusterComponent,
+        data: { pageHeader: NFS_PAGE_HEADER }
+      },
       {
         path: URLVerbs.CREATE,
         component: NfsFormComponent,
@@ -581,6 +591,7 @@ const routes: Routes = [
       }
     ]
   },
+  smbParentRoute(true, 'SMB'),
   {
     path: 'configuration',
     data: { breadcrumbs: 'Configuration' },

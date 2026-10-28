@@ -16,12 +16,15 @@
 #include "common/async/yield_context.h"
 
 #include <boost/asio/io_context.hpp>
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define dout_subsys ceph_subsys_rgw
@@ -35,7 +38,7 @@ struct TestEnv {
   rgw::sal::Driver* driver = nullptr;
   const DoutPrefixProvider* dpp = nullptr;
   std::unique_ptr<rgw::sal::ConfigStore> cfgstore;
-  std::string bucket_name;
+  std::array<std::unique_ptr<rgw::sal::Bucket>, 2> buckets; // S3, Vector
   std::string backend;  // "rados", "dbstore", "posix", etc.
 };
 
@@ -55,7 +58,7 @@ TEST(NullSafety, NullDriverReturnsError) {
   CRgwListResult result{};
 
   // core ops
-  EXPECT_LT(rgw_put_object(nullptr, nullptr, nullptr, &b, &o, &buf, nullptr), 0);
+  EXPECT_LT(rgw_put_object(nullptr, nullptr, nullptr, &b, &o, &buf, nullptr, nullptr, 0), 0);
   EXPECT_LT(rgw_get_object(nullptr, nullptr, nullptr, &b, &o, 0, 0, &buf), 0);
   EXPECT_LT(rgw_delete_object(nullptr, nullptr, nullptr, &b, &o), 0);
   EXPECT_LT(rgw_head_object(nullptr, nullptr, nullptr, &b, &o, &meta), 0);
@@ -65,7 +68,7 @@ TEST(NullSafety, NullDriverReturnsError) {
   // conditional put
   int canceled = 0;
   EXPECT_LT(rgw_put_object_conditional(nullptr, nullptr, nullptr,
-             &b, &o, &buf, nullptr, nullptr, &canceled, nullptr), 0);
+             &b, &o, &buf, nullptr, nullptr, &canceled, nullptr, nullptr, 0), 0);
 
   // copy
   CRgwBucket db{"dst", nullptr};
@@ -79,13 +82,13 @@ TEST(NullSafety, NullDriverReturnsError) {
   EXPECT_LT(rgw_delete_objects(nullptr, nullptr, nullptr, &b, keys, 1), 0);
 
   // multipart
-  char* upload_id = nullptr;
-  EXPECT_LT(rgw_init_multipart(nullptr, nullptr, nullptr, &b, &o, &upload_id), 0);
+  char upload_id[256] = {0};
+  EXPECT_LT(rgw_multipart_init(nullptr, nullptr, nullptr, &b, &o, nullptr, upload_id, sizeof(upload_id)), 0);
 
-  char* etag = nullptr;
+  char etag[256] = {0};
   uint8_t data[] = {0};
   EXPECT_LT(rgw_multipart_put_part(nullptr, nullptr, nullptr,
-             &b, &o, "fake-id", 1, data, 1, &etag), 0);
+             &b, &o, "fake-id", 1, data, 1, etag, sizeof(etag)), 0);
 
   const char* etags[] = {"etag1"};
   EXPECT_LT(rgw_multipart_complete(nullptr, nullptr, nullptr,
@@ -102,13 +105,13 @@ TEST(NullSafety, NullBucketAndKeyReturnsError) {
   CRgwBuffer buf{nullptr, 0};
 
   // null bucket
-  EXPECT_LT(rgw_put_object(driver, nullptr, nullptr, nullptr, &o, &buf, nullptr), 0);
+  EXPECT_LT(rgw_put_object(driver, nullptr, nullptr, nullptr, &o, &buf, nullptr, nullptr, 0), 0);
   EXPECT_LT(rgw_get_object(driver, nullptr, nullptr, nullptr, &o, 0, 0, &buf), 0);
   EXPECT_LT(rgw_delete_object(driver, nullptr, nullptr, nullptr, &o), 0);
   EXPECT_LT(rgw_head_object(driver, nullptr, nullptr, nullptr, &o, nullptr), 0);
 
   // null object key
-  EXPECT_LT(rgw_put_object(driver, nullptr, nullptr, &b, nullptr, &buf, nullptr), 0);
+  EXPECT_LT(rgw_put_object(driver, nullptr, nullptr, &b, nullptr, &buf, nullptr, nullptr, 0), 0);
   EXPECT_LT(rgw_get_object(driver, nullptr, nullptr, &b, nullptr, 0, 0, &buf), 0);
   EXPECT_LT(rgw_delete_object(driver, nullptr, nullptr, &b, nullptr), 0);
 
@@ -119,9 +122,9 @@ TEST(NullSafety, NullBucketAndKeyReturnsError) {
              nullptr, nullptr, nullptr, 100, nullptr), 0);
 
   // multipart null output
-  EXPECT_LT(rgw_init_multipart(driver, nullptr, nullptr, &b, &o, nullptr), 0);
+  EXPECT_LT(rgw_multipart_init(driver, nullptr, nullptr, &b, &o, nullptr, nullptr, 0), 0);
   EXPECT_LT(rgw_multipart_put_part(driver, nullptr, nullptr,
-             &b, &o, "id", 1, nullptr, 0, nullptr), 0);
+             &b, &o, "id", 1, nullptr, 0, nullptr, 0), 0);
 }
 
 
@@ -150,7 +153,7 @@ TEST(Utility, WrapperVersion) {
 // Functional tests — require live driver + bucket
 // ===========================================================================
 
-class SALWrapperTest : public ::testing::Test {
+class SALWrapperTest : public ::testing::TestWithParam<bool> {
 protected:
   CRgwDriver* driver() {
     return reinterpret_cast<CRgwDriver*>(g_env->driver);
@@ -163,13 +166,19 @@ protected:
     if (!g_env || !g_env->driver) {
       GTEST_SKIP() << "SAL driver not initialized";
     }
-    bucket_ = {g_env->bucket_name.c_str(), nullptr};
+    const auto& bucket = g_env->buckets[GetParam()];
+    ASSERT_NE(nullptr, bucket);
+    ASSERT_EQ(GetParam(), bucket->get_info().is_vector());
+    if (GetParam()) {
+      ASSERT_FALSE(bucket->get_info().is_indexless());
+    }
+    bucket_ = {bucket->get_name().c_str(), nullptr, GetParam()};
   }
 
   int put(const char* key, const uint8_t* data, size_t len) {
     CRgwObject obj{key, nullptr};
     CRgwBuffer buf{const_cast<uint8_t*>(data), len};
-    return rgw_put_object(driver(), dpp(), nullptr, &bucket_, &obj, &buf, nullptr);
+    return rgw_put_object(driver(), dpp(), nullptr, &bucket_, &obj, &buf, nullptr, nullptr, 0);
   }
 
   int put_str(const char* key, const std::string& data) {
@@ -217,7 +226,7 @@ protected:
 
 // --------------- Null buffer ---------------
 
-TEST_F(SALWrapperTest, OutputBufferUntouchedOnFailure) {
+TEST_P(SALWrapperTest, OutputBufferUntouchedOnFailure) {
   CRgwBuffer buf{nullptr, 0};
   CRgwObject obj{"test/no-such-key-ever", nullptr};
   EXPECT_EQ(-ENOENT, rgw_get_object(driver(), dpp(), nullptr,
@@ -226,21 +235,21 @@ TEST_F(SALWrapperTest, OutputBufferUntouchedOnFailure) {
   EXPECT_EQ(buf.len, 0u);
 }
 
-TEST_F(SALWrapperTest, NullBufferPut) {
+TEST_P(SALWrapperTest, NullBufferPut) {
   CRgwObject obj{"test/null-buf", nullptr};
 
   // null buffer pointer is treated as a zero-byte put (valid)
-  EXPECT_EQ(0, rgw_put_object(driver(), dpp(), nullptr, &bucket_, &obj, nullptr, nullptr));
+  EXPECT_EQ(0, rgw_put_object(driver(), dpp(), nullptr, &bucket_, &obj, nullptr, nullptr, nullptr, 0));
   created_keys_.emplace_back("test/null-buf");
 
   // buffer with null data but non-zero length is invalid
   CRgwBuffer bad_buf{nullptr, 100};
-  EXPECT_LT(rgw_put_object(driver(), dpp(), nullptr, &bucket_, &obj, &bad_buf, nullptr), 0);
+  EXPECT_LT(rgw_put_object(driver(), dpp(), nullptr, &bucket_, &obj, &bad_buf, nullptr, nullptr, 0), 0);
 }
 
 // --------------- Put / Get ---------------
 
-TEST_F(SALWrapperTest, PutGetRoundTrip) {
+TEST_P(SALWrapperTest, PutGetRoundTrip) {
   std::string data = "hello, SAL wrapper!";
   ASSERT_EQ(0, put_str_tracked("test/put-get", data));
 
@@ -251,7 +260,7 @@ TEST_F(SALWrapperTest, PutGetRoundTrip) {
   rgw_free_buffer(&buf);
 }
 
-TEST_F(SALWrapperTest, PutGetBinaryData) {
+TEST_P(SALWrapperTest, PutGetBinaryData) {
   std::vector<uint8_t> data(256);
   std::iota(data.begin(), data.end(), 0);
   ASSERT_EQ(0, put_tracked("test/binary", data.data(), data.size()));
@@ -264,7 +273,7 @@ TEST_F(SALWrapperTest, PutGetBinaryData) {
 }
 
 // known fail: dbstore, posix — backend does not support multi-chunk reads
-TEST_F(SALWrapperTest, PutGetLargeObject) {
+TEST_P(SALWrapperTest, PutGetLargeObject) {
   size_t test_size = 1024 * 1024;
   std::vector<uint8_t> data(test_size);
   std::iota(data.begin(), data.end(), 0);
@@ -277,7 +286,7 @@ TEST_F(SALWrapperTest, PutGetLargeObject) {
   rgw_free_buffer(&buf);
 }
 
-TEST_F(SALWrapperTest, PutZeroLength) {
+TEST_P(SALWrapperTest, PutZeroLength) {
   ASSERT_EQ(0, put_tracked("test/empty-obj", nullptr, 0));
 
   CRgwObjectMeta meta{};
@@ -286,7 +295,7 @@ TEST_F(SALWrapperTest, PutZeroLength) {
   rgw_free_object_meta(&meta);
 }
 
-TEST_F(SALWrapperTest, PutOverwrite) {
+TEST_P(SALWrapperTest, PutOverwrite) {
   std::string data1 = "first version";
   std::string data2 = "second version, different length";
   ASSERT_EQ(0, put_str_tracked("test/overwrite", data1));
@@ -299,7 +308,7 @@ TEST_F(SALWrapperTest, PutOverwrite) {
   rgw_free_buffer(&buf);
 }
 
-TEST_F(SALWrapperTest, PutGetMultipleObjects) {
+TEST_P(SALWrapperTest, PutGetMultipleObjects) {
   const int count = 10;
   for (int i = 0; i < count; i++) {
     std::string key = "test/multi/obj-" + std::to_string(i);
@@ -318,14 +327,189 @@ TEST_F(SALWrapperTest, PutGetMultipleObjects) {
   }
 }
 
+
+// --------------- Put/Get with Attributes ---------------
+
+TEST_P(SALWrapperTest, PutObjectWithAttributes) {
+  std::string data = "object with attributes";
+  CRgwObject obj{"test/put-with-attrs", nullptr};
+  CRgwBuffer buf{reinterpret_cast<uint8_t*>(const_cast<char*>(data.data())), data.size()};
+  
+  // Set attributes
+  CRgwObjectMeta attrs{};
+  attrs.content_type = const_cast<char*>("text/plain");
+  attrs.cache_control = const_cast<char*>("max-age=3600");
+  attrs.content_encoding = const_cast<char*>("gzip");
+  attrs.metadata = const_cast<char*>("{\"user-key\":\"user-value\",\"x-custom\":\"test\"}");
+  
+  char etag[256] = {0};
+  ASSERT_EQ(0, rgw_put_object(driver(), dpp(), nullptr, &bucket_, &obj, &buf, &attrs, etag, sizeof(etag)));
+  ASSERT_GT(strlen(etag), 0u);
+  created_keys_.emplace_back("test/put-with-attrs");
+  
+  // Verify attributes were set
+  CRgwObjectMeta meta{};
+  ASSERT_EQ(0, head("test/put-with-attrs", &meta));
+  
+  ASSERT_NE(meta.content_type, nullptr);
+  EXPECT_STREQ("text/plain", meta.content_type);
+  
+  ASSERT_NE(meta.cache_control, nullptr);
+  EXPECT_STREQ("max-age=3600", meta.cache_control);
+  
+  ASSERT_NE(meta.content_encoding, nullptr);
+  EXPECT_STREQ("gzip", meta.content_encoding);
+  
+  ASSERT_NE(meta.metadata, nullptr);
+  std::string metadata_str(meta.metadata);
+  EXPECT_TRUE(metadata_str.find("user-key") != std::string::npos);
+  EXPECT_TRUE(metadata_str.find("user-value") != std::string::npos);
+  
+  rgw_free_object_meta(&meta);
+}
+
+TEST_P(SALWrapperTest, PutObjectWithContentType) {
+  std::string data = "JSON content";
+  CRgwObject obj{"test/put-json", nullptr};
+  CRgwBuffer buf{reinterpret_cast<uint8_t*>(const_cast<char*>(data.data())), data.size()};
+  
+  CRgwObjectMeta attrs{};
+  attrs.content_type = const_cast<char*>("application/json");
+  
+  char etag[256] = {0};
+  ASSERT_EQ(0, rgw_put_object(driver(), dpp(), nullptr, &bucket_, &obj, &buf, &attrs, etag, sizeof(etag)));
+  created_keys_.emplace_back("test/put-json");
+  
+  CRgwObjectMeta meta{};
+  ASSERT_EQ(0, head("test/put-json", &meta));
+  ASSERT_NE(meta.content_type, nullptr);
+  EXPECT_STREQ("application/json", meta.content_type);
+  
+  rgw_free_object_meta(&meta);
+}
+
+TEST_P(SALWrapperTest, PutObjectWithCustomMetadata) {
+  std::string data = "data with custom metadata";
+  CRgwObject obj{"test/put-custom-meta", nullptr};
+  CRgwBuffer buf{reinterpret_cast<uint8_t*>(const_cast<char*>(data.data())), data.size()};
+  
+  CRgwObjectMeta attrs{};
+  attrs.metadata = const_cast<char*>("{\"x-amz-meta-author\":\"test-user\",\"x-amz-meta-version\":\"1.0\"}");
+  
+  char etag[256] = {0};
+  ASSERT_EQ(0, rgw_put_object(driver(), dpp(), nullptr, &bucket_, &obj, &buf, &attrs, etag, sizeof(etag)));
+  created_keys_.emplace_back("test/put-custom-meta");
+  
+  CRgwObjectMeta meta{};
+  ASSERT_EQ(0, head("test/put-custom-meta", &meta));
+  ASSERT_NE(meta.metadata, nullptr);
+  
+  std::string metadata_str(meta.metadata);
+  EXPECT_TRUE(metadata_str.find("x-amz-meta-author") != std::string::npos);
+  EXPECT_TRUE(metadata_str.find("test-user") != std::string::npos);
+  EXPECT_TRUE(metadata_str.find("x-amz-meta-version") != std::string::npos);
+  EXPECT_TRUE(metadata_str.find("1.0") != std::string::npos);
+  
+  rgw_free_object_meta(&meta);
+}
+
+TEST_P(SALWrapperTest, PutObjectAttributesOverwrite) {
+  std::string data = "original data";
+  CRgwObject obj{"test/attrs-overwrite", nullptr};
+  CRgwBuffer buf{reinterpret_cast<uint8_t*>(const_cast<char*>(data.data())), data.size()};
+  
+  // First put with initial attributes
+  CRgwObjectMeta attrs1{};
+  attrs1.content_type = const_cast<char*>("text/plain");
+  attrs1.cache_control = const_cast<char*>("max-age=1800");
+  
+  char etag1[256] = {0};
+  ASSERT_EQ(0, rgw_put_object(driver(), dpp(), nullptr, &bucket_, &obj, &buf, &attrs1, etag1, sizeof(etag1)));
+  created_keys_.emplace_back("test/attrs-overwrite");
+  
+  // Second put with different attributes
+  std::string data2 = "updated data";
+  CRgwBuffer buf2{reinterpret_cast<uint8_t*>(const_cast<char*>(data2.data())), data2.size()};
+  CRgwObjectMeta attrs2{};
+  attrs2.content_type = const_cast<char*>("application/json");
+  attrs2.cache_control = const_cast<char*>("max-age=7200");
+  
+  char etag2[256] = {0};
+  ASSERT_EQ(0, rgw_put_object(driver(), dpp(), nullptr, &bucket_, &obj, &buf2, &attrs2, etag2, sizeof(etag2)));
+  
+  // Verify new attributes replaced old ones
+  CRgwObjectMeta meta{};
+  ASSERT_EQ(0, head("test/attrs-overwrite", &meta));
+  
+  ASSERT_NE(meta.content_type, nullptr);
+  EXPECT_STREQ("application/json", meta.content_type);
+  
+  ASSERT_NE(meta.cache_control, nullptr);
+  EXPECT_STREQ("max-age=7200", meta.cache_control);
+  
+  rgw_free_object_meta(&meta);
+}
+
+TEST_P(SALWrapperTest, GetObjectPreservesAttributes) {
+  std::string data = "data to retrieve";
+  CRgwObject obj{"test/get-with-attrs", nullptr};
+  CRgwBuffer put_buf{reinterpret_cast<uint8_t*>(const_cast<char*>(data.data())), data.size()};
+  
+  CRgwObjectMeta attrs{};
+  attrs.content_type = const_cast<char*>("text/html");
+  attrs.content_encoding = const_cast<char*>("deflate");
+  
+  char etag[256] = {0};
+  ASSERT_EQ(0, rgw_put_object(driver(), dpp(), nullptr, &bucket_, &obj, &put_buf, &attrs, etag, sizeof(etag)));
+  created_keys_.emplace_back("test/get-with-attrs");
+  
+  // Get the object
+  CRgwBuffer get_buf{};
+  ASSERT_EQ(0, get("test/get-with-attrs", &get_buf));
+  ASSERT_EQ(data.size(), get_buf.len);
+  EXPECT_EQ(0, memcmp(data.data(), get_buf.data, get_buf.len));
+  
+  // Verify attributes are still present via head
+  CRgwObjectMeta meta{};
+  ASSERT_EQ(0, head("test/get-with-attrs", &meta));
+  
+  ASSERT_NE(meta.content_type, nullptr);
+  EXPECT_STREQ("text/html", meta.content_type);
+  
+  ASSERT_NE(meta.content_encoding, nullptr);
+  EXPECT_STREQ("deflate", meta.content_encoding);
+  
+  rgw_free_buffer(&get_buf);
+  rgw_free_object_meta(&meta);
+}
+
+TEST_P(SALWrapperTest, PutObjectWithNullAttributes) {
+  std::string data = "data without attributes";
+  CRgwObject obj{"test/put-null-attrs", nullptr};
+  CRgwBuffer buf{reinterpret_cast<uint8_t*>(const_cast<char*>(data.data())), data.size()};
+  
+  // Put with null attributes pointer (should succeed)
+  char etag[256] = {0};
+  ASSERT_EQ(0, rgw_put_object(driver(), dpp(), nullptr, &bucket_, &obj, &buf, nullptr, etag, sizeof(etag)));
+  created_keys_.emplace_back("test/put-null-attrs");
+  
+  // Verify object exists and has default/no attributes
+  CRgwObjectMeta meta{};
+  ASSERT_EQ(0, head("test/put-null-attrs", &meta));
+  EXPECT_EQ(data.size(), meta.size);
+  
+  rgw_free_object_meta(&meta);
+}
+
+
 // --------------- Get edge cases ---------------
 
-TEST_F(SALWrapperTest, GetNonExistent) {
+TEST_P(SALWrapperTest, GetNonExistent) {
   CRgwBuffer buf{};
   EXPECT_EQ(-ENOENT, get("test/no-such-key-ever", &buf));
 }
 
-TEST_F(SALWrapperTest, RangeRead) {
+TEST_P(SALWrapperTest, RangeRead) {
   std::vector<uint8_t> data(512);
   std::iota(data.begin(), data.end(), 0);
   ASSERT_EQ(0, put_tracked("test/range-read", data.data(), data.size()));
@@ -337,7 +521,7 @@ TEST_F(SALWrapperTest, RangeRead) {
   rgw_free_buffer(&buf);
 }
 
-TEST_F(SALWrapperTest, RangeReadFromStart) {
+TEST_P(SALWrapperTest, RangeReadFromStart) {
   std::string data = "range-read-from-start-test-data";
   ASSERT_EQ(0, put_str_tracked("test/range-start", data));
 
@@ -348,7 +532,7 @@ TEST_F(SALWrapperTest, RangeReadFromStart) {
   rgw_free_buffer(&buf);
 }
 
-TEST_F(SALWrapperTest, RangeReadToEnd) {
+TEST_P(SALWrapperTest, RangeReadToEnd) {
   std::string data = "read-to-end-data-here";
   ASSERT_EQ(0, put_str_tracked("test/range-end", data));
 
@@ -359,7 +543,7 @@ TEST_F(SALWrapperTest, RangeReadToEnd) {
   rgw_free_buffer(&buf);
 }
 
-TEST_F(SALWrapperTest, RangeReadBeyondObjectSize) {
+TEST_P(SALWrapperTest, RangeReadBeyondObjectSize) {
   std::string data = "short-data";
   ASSERT_EQ(0, put_str_tracked("test/range-beyond", data));
 
@@ -375,7 +559,7 @@ TEST_F(SALWrapperTest, RangeReadBeyondObjectSize) {
 
 // --------------- Conditional get ---------------
 
-TEST_F(SALWrapperTest, ConditionalGetIfMatch) {
+TEST_P(SALWrapperTest, ConditionalGetIfMatch) {
   std::string data = "conditional get data";
   ASSERT_EQ(0, put_str_tracked("test/cond-get", data));
 
@@ -403,7 +587,7 @@ TEST_F(SALWrapperTest, ConditionalGetIfMatch) {
              "wrong-etag", nullptr, nullptr, nullptr, &buf2));
 }
 
-TEST_F(SALWrapperTest, ConditionalGetIfNoneMatch) {
+TEST_P(SALWrapperTest, ConditionalGetIfNoneMatch) {
   std::string data = "none-match data";
   ASSERT_EQ(0, put_str_tracked("test/cond-get-nm", data));
 
@@ -431,7 +615,7 @@ TEST_F(SALWrapperTest, ConditionalGetIfNoneMatch) {
   rgw_free_buffer(&buf2);
 }
 
-TEST_F(SALWrapperTest, ConditionalGetIfModifiedSince) {
+TEST_P(SALWrapperTest, ConditionalGetIfModifiedSince) {
   std::string data = "modified since data";
   ASSERT_EQ(0, put_str_tracked("test/cond-get-mod", data));
 
@@ -461,7 +645,7 @@ TEST_F(SALWrapperTest, ConditionalGetIfModifiedSince) {
              nullptr, nullptr, &future, nullptr, &buf2));
 }
 
-TEST_F(SALWrapperTest, ConditionalGetIfUnmodifiedSince) {
+TEST_P(SALWrapperTest, ConditionalGetIfUnmodifiedSince) {
   std::string data = "unmodified since data";
   ASSERT_EQ(0, put_str_tracked("test/cond-get-unmod", data));
 
@@ -493,7 +677,7 @@ TEST_F(SALWrapperTest, ConditionalGetIfUnmodifiedSince) {
 
 // --------------- Head / Metadata ---------------
 
-TEST_F(SALWrapperTest, HeadObject) {
+TEST_P(SALWrapperTest, HeadObject) {
   std::string data = "metadata test data";
   ASSERT_EQ(0, put_str_tracked("test/head-obj", data));
 
@@ -508,13 +692,13 @@ TEST_F(SALWrapperTest, HeadObject) {
   rgw_free_object_meta(&meta);
 }
 
-TEST_F(SALWrapperTest, HeadNonExistent) {
+TEST_P(SALWrapperTest, HeadNonExistent) {
   CRgwObjectMeta meta{};
   EXPECT_EQ(-ENOENT, head("test/head-nonexistent", &meta));
   rgw_free_object_meta(&meta);
 }
 
-TEST_F(SALWrapperTest, EtagChangesOnOverwrite) {
+TEST_P(SALWrapperTest, EtagChangesOnOverwrite) {
   ASSERT_EQ(0, put_str_tracked("test/etag-change", "version1"));
 
   CRgwObjectMeta meta1{};
@@ -533,7 +717,7 @@ TEST_F(SALWrapperTest, EtagChangesOnOverwrite) {
   rgw_free_object_meta(&meta2);
 }
 
-TEST_F(SALWrapperTest, HeadReflectsCorrectSize) {
+TEST_P(SALWrapperTest, HeadReflectsCorrectSize) {
   std::vector<size_t> sizes = {1, 100, 512, 999};
   for (size_t sz : sizes) {
     std::string key = "test/size-" + std::to_string(sz);
@@ -549,7 +733,7 @@ TEST_F(SALWrapperTest, HeadReflectsCorrectSize) {
 
 // --------------- Delete ---------------
 
-TEST_F(SALWrapperTest, DeleteObject) {
+TEST_P(SALWrapperTest, DeleteObject) {
   std::string data = "to-be-deleted";
   ASSERT_EQ(0, put_str("test/delete-me", data));
 
@@ -560,11 +744,11 @@ TEST_F(SALWrapperTest, DeleteObject) {
   rgw_free_object_meta(&meta);
 }
 
-TEST_F(SALWrapperTest, DeleteNonExistent) {
+TEST_P(SALWrapperTest, DeleteNonExistent) {
   EXPECT_EQ(0, del("test/already-gone"));
 }
 
-TEST_F(SALWrapperTest, DeleteThenPut) {
+TEST_P(SALWrapperTest, DeleteThenPut) {
   std::string data1 = "original";
   ASSERT_EQ(0, put_str("test/delete-reput", data1));
   ASSERT_EQ(0, del("test/delete-reput"));
@@ -579,7 +763,7 @@ TEST_F(SALWrapperTest, DeleteThenPut) {
   rgw_free_buffer(&buf);
 }
 
-TEST_F(SALWrapperTest, BulkDelete) {
+TEST_P(SALWrapperTest, BulkDelete) {
   const int count = 5;
   std::vector<std::string> keys;
   std::vector<const char*> key_ptrs;
@@ -601,7 +785,7 @@ TEST_F(SALWrapperTest, BulkDelete) {
 
 // --------------- List ---------------
 
-TEST_F(SALWrapperTest, ListObjects) {
+TEST_P(SALWrapperTest, ListObjects) {
   // write each object with a distinct size so the size reported by list is
   // meaningful to verify (not all identical).
   std::map<std::string, uint64_t> expected;  // key -> size
@@ -652,7 +836,7 @@ TEST_F(SALWrapperTest, ListObjects) {
   rgw_free_list_result(&result);
 }
 
-TEST_F(SALWrapperTest, ListWithDelimiter) {
+TEST_P(SALWrapperTest, ListWithDelimiter) {
   ASSERT_EQ(0, put_str_tracked("test/delim/a/1", "d"));
   ASSERT_EQ(0, put_str_tracked("test/delim/a/2", "d"));
   ASSERT_EQ(0, put_str_tracked("test/delim/b/1", "d"));
@@ -664,7 +848,7 @@ TEST_F(SALWrapperTest, ListWithDelimiter) {
   rgw_free_list_result(&result);
 }
 
-TEST_F(SALWrapperTest, ListPagination) {
+TEST_P(SALWrapperTest, ListPagination) {
   for (int i = 0; i < 10; i++) {
     std::string key = "test/page/obj-" + std::to_string(i);
     ASSERT_EQ(0, put_str_tracked(key.c_str(), "data"));
@@ -693,7 +877,7 @@ TEST_F(SALWrapperTest, ListPagination) {
   EXPECT_FALSE(truncated);
 }
 
-TEST_F(SALWrapperTest, ListEmpty) {
+TEST_P(SALWrapperTest, ListEmpty) {
   CRgwListResult result{};
   ASSERT_EQ(0, rgw_list_objects(driver(), dpp(), nullptr, &bucket_,
              "no-such-prefix-xyz/", nullptr, nullptr, 100, &result));
@@ -702,7 +886,7 @@ TEST_F(SALWrapperTest, ListEmpty) {
   rgw_free_list_result(&result);
 }
 
-TEST_F(SALWrapperTest, ListReflectsDeletedObjects) {
+TEST_P(SALWrapperTest, ListReflectsDeletedObjects) {
   for (int i = 0; i < 3; i++) {
     std::string key = "test/list-del/obj-" + std::to_string(i);
     ASSERT_EQ(0, put_str(key.c_str(), "data"));
@@ -733,7 +917,7 @@ TEST_F(SALWrapperTest, ListReflectsDeletedObjects) {
 // --------------- Copy ---------------
 
 // known fail: dbstore — copy_object is a no-op stub
-TEST_F(SALWrapperTest, CopyObject) {
+TEST_P(SALWrapperTest, CopyObject) {
   std::string data = "copy me";
   ASSERT_EQ(0, put_str_tracked("test/copy-src", data));
 
@@ -751,7 +935,7 @@ TEST_F(SALWrapperTest, CopyObject) {
 }
 
 // known fail: dbstore — copy_object is a no-op stub
-TEST_F(SALWrapperTest, CopyPreservesData) {
+TEST_P(SALWrapperTest, CopyPreservesData) {
   std::vector<uint8_t> data(512);
   std::iota(data.begin(), data.end(), 0);
   ASSERT_EQ(0, put_tracked("test/copy-bin-src", data.data(), data.size()));
@@ -770,7 +954,7 @@ TEST_F(SALWrapperTest, CopyPreservesData) {
 }
 
 // known fail: dbstore — copy_object is a no-op stub
-TEST_F(SALWrapperTest, CopyNonExistent) {
+TEST_P(SALWrapperTest, CopyNonExistent) {
   CRgwObject src{"test/no-such-copy-src", nullptr};
   CRgwObject dst{"test/copy-dst-fail", nullptr};
   EXPECT_LT(rgw_copy_object(driver(), dpp(), nullptr,
@@ -780,7 +964,7 @@ TEST_F(SALWrapperTest, CopyNonExistent) {
 // --------------- Conditional put ---------------
 
 // known fail: dbstore — ignores conditionals; posix — inverted if_nomatch logic
-TEST_F(SALWrapperTest, ConditionalPutIfNomatch) {
+TEST_P(SALWrapperTest, ConditionalPutIfNomatch) {
   std::string data = "conditional data";
   ASSERT_EQ(0, put_str_tracked("test/cond-put", data));
 
@@ -792,7 +976,7 @@ TEST_F(SALWrapperTest, ConditionalPutIfNomatch) {
   int canceled = 0;
   int ret = rgw_put_object_conditional(driver(), dpp(), nullptr,
                                        &bucket_, &obj, &buf,
-                                       nullptr, "*", &canceled, nullptr);
+                                       nullptr, "*", &canceled, nullptr, nullptr, 0);
   ASSERT_EQ(0, ret);
   EXPECT_EQ(1, canceled);
 
@@ -806,14 +990,14 @@ TEST_F(SALWrapperTest, ConditionalPutIfNomatch) {
 
 // --------------- MaxChunkSize ---------------
 
-TEST_F(SALWrapperTest, MaxChunkSize) {
+TEST_P(SALWrapperTest, MaxChunkSize) {
   uint64_t chunk = rgw_get_max_chunk_size(driver());
   EXPECT_GT(chunk, 0u);
 }
 
 // --------------- Key naming edge cases ---------------
 
-TEST_F(SALWrapperTest, SpecialCharacterKeys) {
+TEST_P(SALWrapperTest, SpecialCharacterKeys) {
   std::string data = "special";
   const char* keys[] = {
     "test/special/key with spaces",
@@ -836,7 +1020,7 @@ TEST_F(SALWrapperTest, SpecialCharacterKeys) {
 // --------------- Conditional put — if_match ---------------
 
 // known fail: dbstore, posix — do not enforce conditional write preconditions
-TEST_F(SALWrapperTest, ConditionalPutIfMatchSucceeds) {
+TEST_P(SALWrapperTest, ConditionalPutIfMatchSucceeds) {
   std::string data = "original";
   ASSERT_EQ(0, put_str_tracked("test/cond-match", data));
 
@@ -853,7 +1037,7 @@ TEST_F(SALWrapperTest, ConditionalPutIfMatchSucceeds) {
   int canceled = 0;
   ASSERT_EQ(0, rgw_put_object_conditional(driver(), dpp(), nullptr,
                                           &bucket_, &obj, &buf,
-                                          etag.c_str(), nullptr, &canceled, nullptr));
+                                          etag.c_str(), nullptr, &canceled, nullptr, nullptr, 0));
   EXPECT_EQ(0, canceled);
 
   CRgwBuffer get_buf{};
@@ -864,7 +1048,7 @@ TEST_F(SALWrapperTest, ConditionalPutIfMatchSucceeds) {
 }
 
 // known fail: dbstore, posix — do not enforce conditional write preconditions
-TEST_F(SALWrapperTest, ConditionalPutIfMatchWrongEtag) {
+TEST_P(SALWrapperTest, ConditionalPutIfMatchWrongEtag) {
   std::string data = "should stay";
   ASSERT_EQ(0, put_str_tracked("test/cond-match-fail", data));
 
@@ -875,7 +1059,7 @@ TEST_F(SALWrapperTest, ConditionalPutIfMatchWrongEtag) {
   int canceled = 0;
   ASSERT_EQ(0, rgw_put_object_conditional(driver(), dpp(), nullptr,
                                           &bucket_, &obj, &buf,
-                                          "bogus-etag", nullptr, &canceled, nullptr));
+                                          "bogus-etag", nullptr, &canceled, nullptr, nullptr, 0));
   EXPECT_EQ(1, canceled);
 
   CRgwBuffer get_buf{};
@@ -888,7 +1072,7 @@ TEST_F(SALWrapperTest, ConditionalPutIfMatchWrongEtag) {
 // --------------- Conditional copy ---------------
 
 // known fail: dbstore — copy_object is a no-op stub
-TEST_F(SALWrapperTest, ConditionalCopyIfNomatch) {
+TEST_P(SALWrapperTest, ConditionalCopyIfNomatch) {
   std::string data = "conditional copy source";
   ASSERT_EQ(0, put_str_tracked("test/ccopy-src", data));
 
@@ -908,7 +1092,7 @@ TEST_F(SALWrapperTest, ConditionalCopyIfNomatch) {
 }
 
 // known fail: dbstore — copy_object is a no-op stub
-TEST_F(SALWrapperTest, ConditionalCopyIfNomatchExists) {
+TEST_P(SALWrapperTest, ConditionalCopyIfNomatchExists) {
   ASSERT_EQ(0, put_str_tracked("test/ccopy-src2", "source data"));
   ASSERT_EQ(0, put_str_tracked("test/ccopy-dst-exists", "existing data"));
 
@@ -932,13 +1116,13 @@ TEST_F(SALWrapperTest, ConditionalCopyIfNomatchExists) {
 // --------------- Multipart upload ---------------
 
 // known fail: dbstore — does not support multi-chunk reads needed to verify multipart
-TEST_F(SALWrapperTest, MultipartBasic) {
+TEST_P(SALWrapperTest, MultipartBasic) {
   CRgwObject obj{"test/multipart-obj", nullptr};
-  char* upload_id = nullptr;
+  char upload_id[256] = {0};
 
-  int ret = rgw_init_multipart(driver(), dpp(), nullptr, &bucket_, &obj, &upload_id);
+  int ret = rgw_multipart_init(driver(), dpp(), nullptr, &bucket_, &obj, nullptr, upload_id, sizeof(upload_id));
   ASSERT_EQ(0, ret);
-  ASSERT_NE(upload_id, nullptr);
+  ASSERT_GT(strlen(upload_id), 0u);
   EXPECT_GT(strlen(upload_id), 0u);
 
   // part 1: 5MB (minimum for non-last parts)
@@ -947,19 +1131,19 @@ TEST_F(SALWrapperTest, MultipartBasic) {
   // part 2: small last part (no minimum)
   std::vector<uint8_t> part2_data(1024, 'B');
 
-  char* etag1 = nullptr;
+  char etag1[256] = {0};
   ret = rgw_multipart_put_part(driver(), dpp(), nullptr, &bucket_, &obj,
                                upload_id, 1,
-                               part1_data.data(), part1_data.size(), &etag1);
+                               part1_data.data(), part1_data.size(), etag1, sizeof(etag1));
   ASSERT_EQ(0, ret);
-  ASSERT_NE(etag1, nullptr);
+  ASSERT_GT(strlen(etag1), 0u);
 
-  char* etag2 = nullptr;
+  char etag2[256] = {0};
   ret = rgw_multipart_put_part(driver(), dpp(), nullptr, &bucket_, &obj,
                                upload_id, 2,
-                               part2_data.data(), part2_data.size(), &etag2);
+                               part2_data.data(), part2_data.size(), etag2, sizeof(etag2));
   ASSERT_EQ(0, ret);
-  ASSERT_NE(etag2, nullptr);
+  ASSERT_GT(strlen(etag2), 0u);
 
   const char* etags[] = {etag1, etag2};
   ret = rgw_multipart_complete(driver(), dpp(), nullptr, &bucket_, &obj,
@@ -973,26 +1157,23 @@ TEST_F(SALWrapperTest, MultipartBasic) {
   EXPECT_EQ(part1_data.size() + part2_data.size(), meta.size);
   rgw_free_object_meta(&meta);
 
-  free(upload_id);
-  free(etag1);
-  free(etag2);
 }
 
-TEST_F(SALWrapperTest, MultipartAbort) {
+TEST_P(SALWrapperTest, MultipartAbort) {
   CRgwObject obj{"test/multipart-abort", nullptr};
-  char* upload_id = nullptr;
+  char upload_id[256] = {0};
 
-  ASSERT_EQ(0, rgw_init_multipart(driver(), dpp(), nullptr,
-                                  &bucket_, &obj, &upload_id));
-  ASSERT_NE(upload_id, nullptr);
+  ASSERT_EQ(0, rgw_multipart_init(driver(), dpp(), nullptr,
+                                  &bucket_, &obj, nullptr, upload_id, sizeof(upload_id)));
+  ASSERT_GT(strlen(upload_id), 0u);
 
   // upload one part
   std::string part_data = "part that will be aborted";
-  char* etag = nullptr;
+  char etag[256] = {0};
   ASSERT_EQ(0, rgw_multipart_put_part(driver(), dpp(), nullptr, &bucket_, &obj,
                                       upload_id, 1,
                                       reinterpret_cast<const uint8_t*>(part_data.data()),
-                                      part_data.size(), &etag));
+                                      part_data.size(), etag, sizeof(etag)));
 
   // abort the upload
   ASSERT_EQ(0, rgw_multipart_abort(driver(), dpp(), nullptr,
@@ -1003,19 +1184,17 @@ TEST_F(SALWrapperTest, MultipartAbort) {
   EXPECT_EQ(-ENOENT, head("test/multipart-abort", &meta));
   rgw_free_object_meta(&meta);
 
-  free(upload_id);
-  free(etag);
 }
 
-TEST_F(SALWrapperTest, MultipartInvalidUploadId) {
+TEST_P(SALWrapperTest, MultipartInvalidUploadId) {
   CRgwObject obj{"test/multipart-bad-id", nullptr};
   std::string data = "data";
-  char* etag = nullptr;
+  char etag[256] = {0};
 
   int ret = rgw_multipart_put_part(driver(), dpp(), nullptr, &bucket_, &obj,
                                    "nonexistent-upload-id", 1,
                                    reinterpret_cast<const uint8_t*>(data.data()),
-                                   data.size(), &etag);
+                                   data.size(), etag, sizeof(etag));
   EXPECT_LT(ret, 0);
 
   const char* etags[] = {"fake"};
@@ -1024,21 +1203,21 @@ TEST_F(SALWrapperTest, MultipartInvalidUploadId) {
   EXPECT_LT(ret, 0);
 }
 
-TEST_F(SALWrapperTest, MultipartSinglePart) {
+TEST_P(SALWrapperTest, MultipartSinglePart) {
   CRgwObject obj{"test/multipart-single", nullptr};
-  char* upload_id = nullptr;
+  char upload_id[256] = {0};
 
-  ASSERT_EQ(0, rgw_init_multipart(driver(), dpp(), nullptr,
-                                  &bucket_, &obj, &upload_id));
-  ASSERT_NE(upload_id, nullptr);
+  ASSERT_EQ(0, rgw_multipart_init(driver(), dpp(), nullptr,
+                                  &bucket_, &obj, nullptr, upload_id, sizeof(upload_id)));
+  ASSERT_GT(strlen(upload_id), 0u);
 
   std::string data = "single part upload content";
-  char* etag = nullptr;
+  char etag[256] = {0};
   ASSERT_EQ(0, rgw_multipart_put_part(driver(), dpp(), nullptr, &bucket_, &obj,
                                       upload_id, 1,
                                       reinterpret_cast<const uint8_t*>(data.data()),
-                                      data.size(), &etag));
-  ASSERT_NE(etag, nullptr);
+                                      data.size(), etag, sizeof(etag)));
+  ASSERT_GT(strlen(etag), 0u);
 
   const char* etags[] = {etag};
   ASSERT_EQ(0, rgw_multipart_complete(driver(), dpp(), nullptr, &bucket_, &obj,
@@ -1050,15 +1229,172 @@ TEST_F(SALWrapperTest, MultipartSinglePart) {
   EXPECT_GT(buf.len, 0u);
   rgw_free_buffer(&buf);
 
-  free(upload_id);
-  free(etag);
 }
+
+
+// Test that multipart complete handles concurrent operations safely with locking
+TEST_P(SALWrapperTest, MultipartCompleteConcurrentSafety) {
+  CRgwObject obj{"test/multipart-concurrent", nullptr};
+  
+  char upload_id[256] = {0};
+  int ret = rgw_multipart_init(driver(), dpp(), nullptr, &bucket_, &obj, 
+                               nullptr, upload_id, sizeof(upload_id));
+  ASSERT_EQ(0, ret);
+  ASSERT_GT(strlen(upload_id), 0u);
+
+  // Upload a single part
+  std::string data = "multipart data for concurrent test";
+  char etag[256] = {0};
+  ret = rgw_multipart_put_part(driver(), dpp(), nullptr, &bucket_, &obj,
+                               upload_id, 1,
+                               reinterpret_cast<const uint8_t*>(data.data()),
+                               data.size(), etag, sizeof(etag));
+  ASSERT_EQ(0, ret);
+  ASSERT_GT(strlen(etag), 0u);
+
+  // Spawn multiple threads to complete the same upload concurrently
+  const int num_threads = 5;
+  std::vector<std::thread> threads;
+  std::atomic<int> success_count{0};
+  std::atomic<int> error_count{0};
+  const char* etags[] = {etag};
+  
+  for (int i = 0; i < num_threads; i++) {
+    threads.emplace_back([&]() {
+      int result = rgw_multipart_complete(driver(), dpp(), nullptr, &bucket_, &obj,
+                                         upload_id, etags, 1);
+      if (result == 0) {
+        success_count++;
+      } else {
+        error_count++;
+      }
+    });
+  }
+  
+  // Wait for all threads to complete
+  for (auto& t : threads) {
+    t.join();
+  }
+  
+  // Only one thread should succeed, others should fail gracefully
+  EXPECT_EQ(1, success_count.load()) << "Expected exactly one successful completion";
+  EXPECT_EQ(num_threads - 1, error_count.load()) << "Expected other threads to fail";
+  
+  created_keys_.emplace_back("test/multipart-concurrent");
+
+  // Verify the object was created successfully
+  CRgwObjectMeta meta{};
+  ASSERT_EQ(0, head("test/multipart-concurrent", &meta));
+  EXPECT_EQ(data.size(), meta.size);
+  
+  rgw_free_object_meta(&meta);
+}
+
+// Test that multipart complete is idempotent (can be called multiple times)
+TEST_P(SALWrapperTest, MultipartCompleteIdempotent) {
+  CRgwObject obj{"test/multipart-idempotent", nullptr};
+  char upload_id[256] = {0};
+
+  ASSERT_EQ(0, rgw_multipart_init(driver(), dpp(), nullptr,
+                                  &bucket_, &obj, nullptr, upload_id, sizeof(upload_id)));
+  ASSERT_GT(strlen(upload_id), 0u);
+
+  // Upload one part
+  std::string data = "idempotent test data";
+  char etag[256] = {0};
+  ASSERT_EQ(0, rgw_multipart_put_part(driver(), dpp(), nullptr, &bucket_, &obj,
+                                      upload_id, 1,
+                                      reinterpret_cast<const uint8_t*>(data.data()),
+                                      data.size(), etag, sizeof(etag)));
+  ASSERT_GT(strlen(etag), 0u);
+
+  // Complete the upload
+  const char* etags[] = {etag};
+  ASSERT_EQ(0, rgw_multipart_complete(driver(), dpp(), nullptr, &bucket_, &obj,
+                                      upload_id, etags, 1));
+  created_keys_.emplace_back("test/multipart-idempotent");
+
+  // Try to complete again with the same upload_id - should fail gracefully
+  // The lock mechanism should prevent racing completions
+  int ret = rgw_multipart_complete(driver(), dpp(), nullptr, &bucket_, &obj,
+                                   upload_id, etags, 1);
+  // Expect either success (idempotent) or specific error indicating upload doesn't exist
+  EXPECT_TRUE(ret == -ERR_NO_SUCH_UPLOAD);
+
+  // Verify the object still exists and is correct
+  CRgwBuffer buf{};
+  ASSERT_EQ(0, get("test/multipart-idempotent", &buf));
+  ASSERT_EQ(data.size(), buf.len);
+  EXPECT_EQ(0, memcmp(data.data(), buf.data, buf.len));
+  rgw_free_buffer(&buf);
+
+}
+
+// Test multipart with custom metadata
+TEST_P(SALWrapperTest, MultipartWithCustomMetadata) {
+  CRgwObject obj{"test/multipart-custom-meta", nullptr};
+  
+  // Create attributes with custom metadata (JSON format)
+  CRgwObjectMeta init_attrs{};
+  init_attrs.content_type = const_cast<char*>("text/plain");
+  init_attrs.metadata = const_cast<char*>("{\"user-key\":\"user-value\",\"x-custom\":\"test\"}");
+  
+  char upload_id[256] = {0};
+  int ret = rgw_multipart_init(driver(), dpp(), nullptr, &bucket_, &obj, 
+                               &init_attrs, upload_id, sizeof(upload_id));
+  ASSERT_EQ(0, ret);
+  ASSERT_GT(strlen(upload_id), 0u);
+
+  // Upload a part
+  std::string data = "data with custom metadata";
+  char etag[256] = {0};
+  ret = rgw_multipart_put_part(driver(), dpp(), nullptr, &bucket_, &obj,
+                               upload_id, 1,
+                               reinterpret_cast<const uint8_t*>(data.data()),
+                               data.size(), etag, sizeof(etag));
+  ASSERT_EQ(0, ret);
+  ASSERT_GT(strlen(etag), 0u);
+
+  // Complete the upload
+  const char* etags[] = {etag};
+  ret = rgw_multipart_complete(driver(), dpp(), nullptr, &bucket_, &obj,
+                               upload_id, etags, 1);
+  ASSERT_EQ(0, ret);
+  created_keys_.emplace_back("test/multipart-custom-meta");
+
+  // Verify metadata was preserved
+  CRgwObjectMeta meta{};
+  ASSERT_EQ(0, head("test/multipart-custom-meta", &meta));
+  
+  ASSERT_NE(meta.content_type, nullptr);
+  EXPECT_STREQ("text/plain", meta.content_type);
+  
+  // Custom metadata should be preserved
+  ASSERT_NE(meta.metadata, nullptr);
+  std::string metadata_str(meta.metadata);
+  EXPECT_TRUE(metadata_str.find("user-key") != std::string::npos);
+  EXPECT_TRUE(metadata_str.find("user-value") != std::string::npos);
+  
+  rgw_free_object_meta(&meta);
+}
+
+
+INSTANTIATE_TEST_SUITE_P(
+    BucketTypes, SALWrapperTest, ::testing::Values(false, true),
+    [](const ::testing::TestParamInfo<bool>& info) {
+      return info.param ? "Vector" : "S3";
+    });
 
 // ===========================================================================
 // main() — bootstrap SAL driver
 // ===========================================================================
 
 int main(int argc, char** argv) {
+  testing::InitGoogleTest(&argc, argv);
+  if (::testing::GTEST_FLAG(list_tests)) {
+    return RUN_ALL_TESTS();
+  }
+
   // ceph.conf is found via -c flag, $CEPH_CONF, or default paths.
   // When running under teuthology, the default path is used.
   auto args = argv_to_vec(argc, const_cast<const char**>(argv));
@@ -1070,6 +1406,9 @@ int main(int argc, char** argv) {
   if (!g_conf()->rgw_region.empty() && g_conf()->rgw_zonegroup.empty()) {
     g_conf().set_val_or_die("rgw_zonegroup", g_conf()->rgw_region.c_str());
   }
+
+  // Vector cases store objects directly in RGW. Use the same backend on removal.
+  g_conf().set_val_or_die("rgw_s3vector_backend", "rgw");
 
   common_init_finish(g_ceph_context);
 
@@ -1127,54 +1466,72 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // create test bucket via SAL API with proper zonegroup + placement
-  env.bucket_name = "sal-wrapper-test-" + std::to_string(getpid());
-  {
+  // Create one bucket in each namespace with native object storage.
+  int ret = 0;
+  for (const bool is_vector : {false, true}) {
+    if (is_vector && env.backend != "rados") {
+      continue;
+    }
     rgw_bucket b;
-    b.name = env.bucket_name;
+    b.name = std::string("sal-wrapper-test-") +
+        (is_vector ? "vector-" : "s3-") + std::to_string(getpid());
 
     std::unique_ptr<rgw::sal::Bucket> bucket;
-    r = env.driver->load_bucket(env.dpp, b, &bucket, null_yield);
+    r = is_vector
+        ? env.driver->load_vector_bucket(env.dpp, b, &bucket, null_yield)
+        : env.driver->load_bucket(env.dpp, b, &bucket, null_yield);
+    if ((r < 0 && r != -ENOENT) || !bucket) {
+      std::cerr << "ERROR: failed to load test bucket '" << b.name
+                << "' (r=" << r << ")" << std::endl;
+      ret = 1;
+      break;
+    }
 
-    if (bucket) {
-      rgw::sal::Bucket::CreateParams params;
-      rgw_user uid{"", "sal-wrapper-test-user"};
-      params.owner = uid;
-      params.zonegroup_id = site.get_zonegroup().get_id();
-      params.placement_rule = site.get_zonegroup().default_placement;
-      params.zone_placement = rgw::find_zone_placement(
-          env.dpp, site.get_zone_params(), params.placement_rule);
-
-      r = bucket->create(env.dpp, params, null_yield);
-      if (r < 0 && r != -EEXIST) {
-        std::cerr << "ERROR: failed to create test bucket (r=" << r << ")" << std::endl;
-        env.driver->shutdown();
-        DriverManager::close_storage(env.driver);
-        return 1;
+    rgw::sal::Bucket::CreateParams params;
+    params.owner = rgw_user{"", "sal-wrapper-test-user"};
+    params.zonegroup_id = site.get_zonegroup().get_id();
+    params.placement_rule = site.get_zonegroup().default_placement;
+    params.zone_placement = rgw::find_zone_placement(
+        env.dpp, site.get_zone_params(), params.placement_rule);
+    if (is_vector) {
+      if (!params.zone_placement ||
+          params.zone_placement->index_type != rgw::BucketIndexType::Normal) {
+        std::cerr << "ERROR: vector tests require indexed bucket placement" << std::endl;
+        ret = 1;
+        break;
       }
-    } else {
-      std::cerr << "ERROR: load_bucket returned no bucket object" << std::endl;
-      env.driver->shutdown();
-      DriverManager::close_storage(env.driver);
-      return 1;
+      params.attrs[RGW_ATTR_S3VECTOR_STORAGE].append("vector_bucket");
     }
+
+    r = bucket->create(env.dpp, params, null_yield);
+    if (r < 0 && r != -EEXIST) {
+      std::cerr << "ERROR: failed to create test bucket '" << b.name
+                << "' (r=" << r << ")" << std::endl;
+      ret = 1;
+      break;
+    }
+    env.buckets[is_vector] = std::move(bucket);
   }
 
-  testing::InitGoogleTest(&argc, argv);
-  int ret = RUN_ALL_TESTS();
-
-  // cleanup: delete test bucket and all objects in it
-  if (env.driver) {
-    rgw_bucket b;
-    b.name = env.bucket_name;
-    std::unique_ptr<rgw::sal::Bucket> bucket;
-    if (env.driver->load_bucket(env.dpp, b, &bucket, null_yield) == 0 && bucket) {
-      bucket->remove(env.dpp, true, null_yield);
-    }
-    env.driver->shutdown();
-    DriverManager::close_storage(env.driver);
-    env.driver = nullptr;
+  if (ret == 0) {
+    ret = RUN_ALL_TESTS();
   }
+
+  // Each SAL bucket removes its own namespace, including any leftover objects.
+  for (auto& bucket : env.buckets) {
+    if (bucket) {
+      r = bucket->remove(env.dpp, true, null_yield);
+      if (r < 0) {
+        std::cerr << "ERROR: failed to remove test bucket '" << bucket->get_name()
+                  << "' (r=" << r << ")" << std::endl;
+        ret = 1;
+      }
+      bucket.reset();
+    }
+  }
+  env.driver->shutdown();
+  DriverManager::close_storage(env.driver);
+  env.driver = nullptr;
 
   return ret;
 }

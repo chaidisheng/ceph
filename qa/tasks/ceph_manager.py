@@ -2250,17 +2250,19 @@ class CephManager:
             assert pool_name not in self.pools
             self.log("creating pool_name %s" % (pool_name,))
             if erasure_code_profile_name:
-                cmd_args = ['osd', 'pool', 'create', 
-                            pool_name, str(pg_num), 
-                            str(pg_num), 'erasure', 
+                cmd_args = ['osd', 'pool', 'create',
+                            pool_name, str(pg_num),
+                            str(pg_num), 'erasure',
                             erasure_code_profile_name]
 
                 if erasure_code_crush_rule_name:
                     cmd_args.extend([erasure_code_crush_rule_name])
+
                 self.raw_cluster_cmd(*cmd_args)
             else:
-                self.raw_cluster_cmd('osd', 'pool', 'create',
-                                     pool_name, str(pg_num))
+                cmd_args = ['osd', 'pool', 'create',
+                            pool_name, str(pg_num)]
+                self.raw_cluster_cmd(*cmd_args)
             if min_size is not None:
                 self.raw_cluster_cmd(
                     'osd', 'pool', 'set', pool_name,
@@ -3308,7 +3310,22 @@ class CephManager:
             self._assert_ipmi(remote)
             remote.console.power_on()
             self.make_admin_daemon_dir(remote)
-        self.ctx.daemons.get_daemon('mon', mon, self.cluster).restart()
+        daemon = self.ctx.daemons.get_daemon('mon', mon, self.cluster)
+        try:
+            daemon.restart()
+        except CommandFailedError:
+            if not self.cephadm:
+                raise
+            # https://tracker.ceph.com/issues/80583
+            # Reset failed systemd state if mon restart failed during thrashing
+            # before retrying to prevent mon quorum timeout
+            fsid = self.ctx.ceph[self.cluster].fsid
+            service = 'ceph-{fsid}@mon.{mon}'.format(fsid=fsid, mon=mon)
+            self.log('restarting mon.{m} failed, resetting systemd state for '
+                     '{s} and retrying'.format(m=mon, s=service))
+            self.find_remote('mon', mon).run(
+                args=['sudo', 'systemctl', 'reset-failed', service])
+            daemon.restart()
 
     def revive_mgr(self, mgr):
         """

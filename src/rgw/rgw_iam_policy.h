@@ -24,6 +24,7 @@
 
 #include "common/ceph_time.h"
 #include "common/iso_8601.h"
+#include "log/Log.h"
 
 #include "rapidjson/error/error.h"
 #include "rapidjson/error/en.h"
@@ -290,6 +291,13 @@ inline int op_to_perm(std::uint64_t op) {
   case s3ListBucketVersions:
   case s3ListMultipartUploadParts:
   case s3GetObjectVersionForReplication:
+  case s3vectorsGetVectors:
+  case s3vectorsGetVectorBucket:
+  case s3vectorsGetIndex:
+  case s3vectorsListVectors:
+  case s3vectorsListVectorBuckets:
+  case s3vectorsListIndexes:
+  case s3vectorsQueryVectors:
     return RGW_PERM_READ;
 
   case s3AbortMultipartUpload:
@@ -309,6 +317,12 @@ inline int op_to_perm(std::uint64_t op) {
   case s3ReplicateDelete:
   case s3ReplicateObject:
   case s3ReplicateTags:
+  case s3vectorsCreateIndex:
+  case s3vectorsCreateVectorBucket:
+  case s3vectorsDeleteIndex:
+  case s3vectorsDeleteVectorBucket:
+  case s3vectorsDeleteVectors:
+  case s3vectorsPutVectors:
     return RGW_PERM_WRITE;
 
   case s3GetAccelerateConfiguration:
@@ -331,6 +345,7 @@ inline int op_to_perm(std::uint64_t op) {
   case s3GetBucketObjectLockConfiguration:
   case s3GetBucketPublicAccessBlock:
   case s3GetBucketOwnershipControls:
+  case s3vectorsGetVectorBucketPolicy:
     return RGW_PERM_READ_ACP;
 
   case s3DeleteBucketPolicy:
@@ -355,9 +370,22 @@ inline int op_to_perm(std::uint64_t op) {
   case s3PutBucketObjectLockConfiguration:
   case s3PutBucketPublicAccessBlock:
   case s3PutBucketOwnershipControls:
+  case s3vectorsDeleteVectorBucketPolicy:
+  case s3vectorsPutVectorBucketPolicy:
     return RGW_PERM_WRITE_ACP;
 
+  case snsGetTopicAttributes:
+  case snsListTopics:
+    return RGW_PERM_READ;
+
+  case snsCreateTopic:
+  case snsSetTopicAttributes:
+  case snsDeleteTopic:
+  case snsPublish:
+    return RGW_PERM_WRITE;
+
   case s3All:
+  case s3vectorsAll:
     return RGW_PERM_FULL_CONTROL;
   }
   return RGW_PERM_INVALID;
@@ -365,12 +393,6 @@ inline int op_to_perm(std::uint64_t op) {
 }
 
 std::string_view action_bit_string(action_t action);
-
-enum class PolicyPrincipal {
-  Role,
-  Session,
-  Other
-};
 
 using Environment = std::unordered_multimap<std::string, std::string>;
 
@@ -721,13 +743,13 @@ struct Statement {
               std::uint64_t action,
               boost::optional<const ARN&> resource,
               const LogOut& eval_log,
-              boost::optional<PolicyPrincipal&> princ_type=boost::none) const;
+              boost::optional<rgw::auth::Principal>& principal) const;
 
   Effect eval_principal(
     const Environment& e,
     boost::optional<const rgw::auth::Identity&> ida,
     const LogOut& eval_log,
-    boost::optional<PolicyPrincipal&> princ_type = boost::none) const;
+    boost::optional<rgw::auth::Principal>& principal) const;
 
   Effect
   eval_conditions(const Environment& e,
@@ -774,16 +796,16 @@ struct Policy {
               boost::optional<const rgw::auth::Identity&> ida,
               std::uint64_t action,
               boost::optional<const ARN&> resource,
-              boost::optional<PolicyPrincipal&> princ_type = boost::none) const {
-    return eval(e, ida, action, resource, out, princ_type);
+              boost::optional<rgw::auth::Principal>& principal) const {
+    return eval(e, ida, action, resource, out, principal);
   }
 
   Effect eval(const Environment& e,
               boost::optional<const rgw::auth::Identity&> ida,
               std::uint64_t action,
               boost::optional<const ARN&> resource,
-              boost::optional<PolicyPrincipal&> princ_type = boost::none) const {
-    return eval(e, ida, action, resource, {}, princ_type);
+              boost::optional<rgw::auth::Principal>& principal) const {
+    return eval(e, ida, action, resource, {}, principal);
   }
 
   Effect eval(const DoutPrefixProvider* dpp,
@@ -791,15 +813,15 @@ struct Policy {
               boost::optional<const rgw::auth::Identity&> ida,
               std::uint64_t action,
               boost::optional<const ARN&> resource,
-              boost::optional<PolicyPrincipal&> princ_type = boost::none) const {
-      return eval(e, ida, action, resource, dpp, princ_type);
+              boost::optional<rgw::auth::Principal>& principal) const {
+      return eval(e, ida, action, resource, dpp, principal);
   }
 
   Effect eval_principal(
       const Environment& e,
       boost::optional<const rgw::auth::Identity&> ida,
       const LogOut& eval_log,
-      boost::optional<PolicyPrincipal&> princ_type = boost::none) const;
+      boost::optional<rgw::auth::Principal>& principal) const;
 
   Effect eval_conditions(const Environment& e,
                          const LogOut& eval_log) const;
@@ -844,7 +866,7 @@ private:
               std::uint64_t action,
               boost::optional<const ARN&> resource,
               const LogOut& eval_log,
-              boost::optional<PolicyPrincipal&> princ_type  =boost::none) const;
+              boost::optional<rgw::auth::Principal>& principal) const;
 
 };
 

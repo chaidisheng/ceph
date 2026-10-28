@@ -250,7 +250,21 @@ function install_boost_on_ubuntu {
         ceph-libboost-thread${boost_ver}-dev \
         ceph-libboost-timer${boost_ver}-dev \
         ceph-libboost-url${boost_ver}-dev \
-	|| ci_debug "ceph-libboost package unavailable, you can build the submodule"
+	|| {
+        # Normally cmake falls back to building the boost submodule.  Set
+        # REQUIRE_BOOST_PKGS when that fallback would be wrong: a build
+        # environment that is reused elsewhere (CI build-with-container
+        # images are kept for a week, and build trees move between them)
+        # must not quietly end up without /opt/ceph boost, or a tree
+        # configured against it fails there with FindBoost "0.0.0" or a
+        # missing libboost_*.so.  Failing here makes the image build fail
+        # while shaman/chacra is unreachable instead.
+        if [ -n "$REQUIRE_BOOST_PKGS" ]; then
+            echo "ERROR: ceph-libboost${boost_ver} packages unavailable from shaman and REQUIRE_BOOST_PKGS is set" >&2
+            exit 1
+        fi
+        ci_debug "ceph-libboost package unavailable, you can build the submodule"
+    }
 
 }
 
@@ -429,7 +443,6 @@ if [ x$(uname)x = xFreeBSDx ]; then
     exit
 else
     [ $WITH_CRIMSON ] && with_crimson=true || with_crimson=false
-    [ $WITH_PMEM ] && with_pmem=true || with_pmem=false
     source /etc/os-release
     case "$ID" in
     debian|ubuntu|devuan|elementary|softiron)
@@ -505,9 +518,6 @@ else
         fi
         if $with_crimson; then
             build_profiles+=",pkg.ceph.crimson"
-        fi
-        if $with_pmem; then
-            build_profiles+=",pkg.ceph.pmdk"
         fi
 
         ci_debug "for_make_check=$for_make_check"

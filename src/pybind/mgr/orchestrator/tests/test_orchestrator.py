@@ -147,6 +147,44 @@ def test_handle_command():
         retval=-2, stdout='', stderr='No orchestrator configured (try `ceph orch set backend`)')
 
 
+@pytest.mark.parametrize('svc_arg,paths', [
+    ('host0:/dev/sda,/dev/sdb', ['/dev/sda', '/dev/sdb']),
+    (
+        'host0:/dev/disk/by-path/pci-0000:cd:00.0-nvme-1',
+        ['/dev/disk/by-path/pci-0000:cd:00.0-nvme-1'],
+    ),
+    (
+        'host0:/dev/disk/by-path/pci-0000:c9:00.0-nvme-1,'
+        '/dev/disk/by-path/pci-0000:cd:00.0-nvme-1',
+        [
+            '/dev/disk/by-path/pci-0000:c9:00.0-nvme-1',
+            '/dev/disk/by-path/pci-0000:cd:00.0-nvme-1',
+        ],
+    ),
+    (
+        'host0:data_devices=/dev/disk/by-path/pci-0000:cd:00.0-nvme-1',
+        ['/dev/disk/by-path/pci-0000:cd:00.0-nvme-1'],
+    ),
+])
+def test_daemon_add_osd_device_paths(svc_arg, paths):
+    m = OrchestratorCli('orchestrator', 0, 0)
+    with mock.patch.object(m, 'create_osds', return_value=OrchResult('Scheduled')) as create_osds:
+        r = m._daemon_add_osd(svc_arg, method='raw')
+    assert r.retval == 0
+    assert r.stdout == 'Scheduled'
+    drive_group = create_osds.call_args[0][0]
+    assert drive_group.placement.host_pattern.pattern == 'host0'
+    assert [dev.path for dev in drive_group.data_devices.paths] == paths
+    assert drive_group.method == 'raw'
+
+
+def test_daemon_add_osd_rejects_spec_without_separator():
+    m = OrchestratorCli('orchestrator', 0, 0)
+    r = m._daemon_add_osd('host0')
+    assert r.retval != 0
+    assert "Invalid 'host:device' spec" in r.stderr
+
+
 r = OrchResult([ServiceDescription(spec=ServiceSpec(service_type='osd'), running=123)])
 
 
@@ -180,6 +218,26 @@ def test_orch_ls(_describe_service):
           size: 0
         """).lstrip()
     assert r == HandleCommandResult(retval=0, stdout=out, stderr='')
+
+
+@mock.patch("orchestrator.OrchestratorCli.describe_service", return_value=OrchResult([]))
+def test_orch_ls_empty(_describe_service):
+    m = OrchestratorCli('orchestrator', 0, 0)
+
+    # plain format keeps the human-readable message
+    r = m._handle_command(None, {'prefix': 'orch ls'})
+    assert r == HandleCommandResult(retval=0, stdout='No services reported', stderr='')
+
+    # structured formats must stay parseable when nothing matches,
+    # e.g. 'orch ls --service-type nvmeof --format json'
+    r = m._handle_command(None, {'prefix': 'orch ls', 'format': 'json'})
+    assert json.loads(r.stdout) == []
+
+    r = m._handle_command(None, {'prefix': 'orch ls', 'format': 'yaml'})
+    assert yaml.safe_load(r.stdout) is None
+
+    r = m._handle_command(None, {'prefix': 'orch ls', 'export': True})
+    assert yaml.safe_load(r.stdout) is None
 
 
 dlist = OrchResult([DaemonDescription(daemon_type="osd", daemon_id="1"), DaemonDescription(
@@ -399,6 +457,53 @@ class TestApplyOAuth2Proxy:
         assert (
             'unrecognized command -i; -h or --help for usage'
         ) in res.stderr
+        mock_apply_misc.assert_not_called()
+
+    def test_cli_args_propagated_to_spec(self, mock_apply_misc):
+        mock_apply_misc.return_value = HandleCommandResult(retval=0, stdout="Success")
+
+        res = self.m._apply_oauth2_proxy(
+            provider_display_name="My OIDC Provider",
+            oidc_issuer_url="https://idp.example.com",
+            client_id="oauth-client",
+            client_secret="oauth-secret",
+        )
+
+        assert res.retval == 0
+        mock_apply_misc.assert_called_once()
+        spec = mock_apply_misc.call_args[0][0][0]
+        assert spec.provider_display_name == "My OIDC Provider"
+        assert spec.oidc_issuer_url == "https://idp.example.com"
+        assert spec.client_id == "oauth-client"
+        assert spec.client_secret == "oauth-secret"
+
+    def test_cli_args_with_https_address(self, mock_apply_misc):
+        mock_apply_misc.return_value = HandleCommandResult(retval=0, stdout="Success")
+
+        res = self.m._apply_oauth2_proxy(
+            provider_display_name="My OIDC Provider",
+            oidc_issuer_url="https://idp.example.com",
+            client_id="oauth-client",
+            client_secret="oauth-secret",
+            https_address="gateway.example.com:443",
+        )
+
+        assert res.retval == 0
+        spec = mock_apply_misc.call_args[0][0][0]
+        assert spec.https_address == "gateway.example.com:443"
+        assert spec.provider_display_name == "My OIDC Provider"
+        assert spec.oidc_issuer_url == "https://idp.example.com"
+        assert spec.client_id == "oauth-client"
+        assert spec.client_secret == "oauth-secret"
+
+    def test_partial_cli_args_raises_error(self, mock_apply_misc):
+        res = self.m._apply_oauth2_proxy(
+            provider_display_name="My OIDC Provider",
+            client_id="oauth-client",
+        )
+
+        assert res.retval != 0
+        assert 'Missing required fields for oauth2-proxy' in res.stderr
         mock_apply_misc.assert_not_called()
 
 

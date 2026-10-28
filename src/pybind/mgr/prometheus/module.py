@@ -7,6 +7,7 @@ import re
 import threading
 import time
 import errno
+import ssl
 import enum
 from collections import namedtuple
 from collections import OrderedDict
@@ -16,8 +17,8 @@ from cherrypy import _cptree
 
 from .cli import PrometheusCLICommand
 
-from mgr_module import MgrModule, MgrStandbyModule, PG_STATES, Option, ServiceInfoT, HandleCommandResult
-from mgr_util import get_default_addr, profile_method, build_url, test_port_allocation, PortAlreadyInUse
+from mgr_module import MgrModule, MgrStandbyModule, PG_STATES, Option, ServiceInfoT, HandleCommandResult, _get_localized_key
+from mgr_util import get_default_addr, profile_method, build_url, test_port_allocation, PortAlreadyInUse, verify_tls_files
 from orchestrator import OrchestratorClientMixin, raise_if_exception, OrchestratorError
 from rbd import RBD
 
@@ -31,6 +32,7 @@ MetricValue = Dict[LabelValues, Number]
 # for Prometheus exporter port registry
 
 DEFAULT_PORT = 9283
+DEFAULT_SSL_PORT = 9284
 
 # to access things in class Module from subclass Root.  Because
 # it's a dict, the writer doesn't need to declare 'global' for access
@@ -67,6 +69,51 @@ def _wait_for_port_available(
             log.debug(f'Port check failed with: {e}')
             return True
     return False
+
+
+def _build_ssl_info(mod: Any) -> Dict[str, Any]:
+    """Resolve the Prometheus TLS cert/key and build an SSLContext.
+
+    The certificate/key stored via the `prometheus set-ssl-certificate`
+    commands (config-key store) take precedence over the crt_file/key_file
+    options; a warning is logged when both are set. Raises if the cert/key
+    are missing or invalid.
+    """
+    cert = mod.get_localized_store("crt")
+    pkey = mod.get_localized_store("key")
+    crt_file = cast(str, mod.get_localized_module_option('crt_file'))
+    key_file = cast(str, mod.get_localized_module_option('key_file'))
+
+    if (cert is not None or pkey is not None) and (crt_file or key_file):
+        mod.log.warning(
+            'Prometheus TLS certificate/key stored with the '
+            '`prometheus set-ssl-certificate` commands take precedence '
+            'over crt_file/key_file. Run `ceph prometheus '
+            'clear-ssl-certificate` before using file-based TLS configuration.'
+        )
+
+    if cert is not None:
+        mod.cert_tmp = NamedTemporaryFile()
+        mod.cert_tmp.write(cert.encode('utf-8'))
+        mod.cert_tmp.flush()
+        cert_fname = mod.cert_tmp.name
+    else:
+        cert_fname = crt_file
+
+    if pkey is not None:
+        mod.pkey_tmp = NamedTemporaryFile()
+        mod.pkey_tmp.write(pkey.encode('utf-8'))
+        mod.pkey_tmp.flush()
+        pkey_fname = mod.pkey_tmp.name
+    else:
+        pkey_fname = key_file
+
+    verify_tls_files(cert_fname, pkey_fname)
+
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    context.load_cert_chain(cert_fname, pkey_fname)
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    return {'cert': cert_fname, 'key': pkey_fname, 'context': context}
 
 
 def health_status_to_number(status: str) -> int:
@@ -125,7 +172,7 @@ OSD_STATS = ['apply_latency_ms', 'commit_latency_ms']
 
 POOL_METADATA = ('pool_id', 'name', 'type', 'description', 'compression_mode', 'application')
 
-RGW_METADATA = ('ceph_daemon', 'hostname', 'ceph_version', 'instance_id')
+RGW_METADATA = ('ceph_daemon', 'hostname', 'ceph_version', 'instance_id', 'zone_id')
 
 RBD_MIRROR_METADATA = ('ceph_daemon', 'id', 'instance_id', 'hostname',
                        'ceph_version')
@@ -750,6 +797,26 @@ class Module(MgrModule, OrchestratorClientMixin):
             desc='Maximum number of health check history entries to keep',
             runtime=True
         ),
+        Option(
+            name='ssl',
+            type='bool',
+            default=False,
+            desc='Enable SSL/TLS for the metrics endpoint'),
+        Option(
+            name='ssl_server_port',
+            type='int',
+            default=DEFAULT_SSL_PORT,
+            desc='Port for HTTPS when ssl is enabled'),
+        Option(
+            name='crt_file',
+            type='str',
+            default='',
+            desc='Path to SSL certificate file'),
+        Option(
+            name='key_file',
+            type='str',
+            default='',
+            desc='Path to SSL key file'),
     ]
 
     STALE_CACHE_FAIL = 'fail'
@@ -1399,6 +1466,25 @@ class Module(MgrModule, OrchestratorClientMixin):
                     'osd.{}'.format(id_),
                 ))
 
+    def get_rgw_zone_ids(self) -> Dict[str, str]:
+        """
+        Map RGW daemons to the zone id they registered in the service map.
+        Keyed both by service map id (gid) and by daemon name (metadata 'id'),
+        since the instance_id label is derived from either of them.
+        """
+        zone_ids: Dict[str, str] = {}
+        service_map = self.get('service_map')
+        daemons = service_map.get('services', {}).get('rgw', {}).get('daemons', {})
+        for gid, daemon in daemons.items():
+            if not isinstance(daemon, dict):
+                continue
+            metadata = daemon.get('metadata', {})
+            zone_id = metadata.get('zone_id', '')
+            zone_ids[str(gid)] = zone_id
+            if metadata.get('id'):
+                zone_ids[metadata['id']] = zone_id
+        return zone_ids
+
     def get_service_list(self) -> Dict[Tuple[str, str], Tuple[str, str, str]]:
         ret = {}
         for server in self.list_servers():
@@ -1594,6 +1680,7 @@ class Module(MgrModule, OrchestratorClientMixin):
         # If orchestrator is available and ceph-exporter is running modify rgw instance id
         # to match the one from exporter
         modify_instance_id = self.orch_is_available() and self.get_module_option('exclude_perf_counters')
+        rgw_zone_ids = self.get_rgw_zone_ids()
         if modify_instance_id:
             daemons = raise_if_exception(self.list_daemons(daemon_type='rgw'))
             for daemon in daemons:
@@ -1605,7 +1692,8 @@ class Module(MgrModule, OrchestratorClientMixin):
                                                  (f"{daemon.daemon_type}.{daemon.daemon_id}",
                                                   str(daemon.hostname),
                                                   str(daemon.version),
-                                                  instance_id))
+                                                  instance_id,
+                                                  rgw_zone_ids.get(daemon.daemon_id or '', '')))
         for key, value in servers.items():
             service_id, service_type = key
             if service_type == 'rgw' and not modify_instance_id:
@@ -1613,7 +1701,8 @@ class Module(MgrModule, OrchestratorClientMixin):
                 self.metrics['rgw_metadata'].set(
                     1,
                     ('{}.{}'.format(service_type, name),
-                     hostname, version, service_id)
+                     hostname, version, service_id,
+                     rgw_zone_ids.get(service_id, ''))
                 )
             elif service_type == 'rbd-mirror':
                 mirror_metadata = self.get_metadata('rbd-mirror', service_id)
@@ -1707,7 +1796,7 @@ class Module(MgrModule, OrchestratorClientMixin):
             pools[pool_name].add(namespace_name)
 
         rbd_stats_pools = {}
-        for pool_id in self.rbd_stats['pools'].keys():
+        for pool_id in list(self.rbd_stats['pools']):
             name = self.rbd_stats['pools'][pool_id]['name']
             if name not in pools:
                 del self.rbd_stats['pools'][pool_id]
@@ -1908,10 +1997,13 @@ class Module(MgrModule, OrchestratorClientMixin):
         """
         new_metrics = {}
         for metric_path, metrics in self.metrics.items():
-            # Address RGW sync perf. counters.
-            match = re.search(r'^data-sync-from-(.*)\.', metric_path)
+            # Address RGW sync perf. counters. Zone names may contain
+            # characters such as hyphens and underscores.
+            match = re.match(r'^data-sync-from-(.+)\.(\w+)$', metric_path)
             if match:
-                new_path = re.sub('from-([^.]*)', 'from-zone', metric_path)
+                zone_name = match.group(1)
+                counter_name = match.group(2)
+                new_path = 'data-sync-from-zone.' + counter_name
                 if new_path not in new_metrics:
                     new_metrics[new_path] = Metric(
                         metrics.mtype,
@@ -1920,7 +2012,7 @@ class Module(MgrModule, OrchestratorClientMixin):
                         cast(LabelValues, metrics.labelnames) + ('source_zone',)
                     )
                 for label_values, value in metrics.value.items():
-                    new_metrics[new_path].set(value, label_values + (match.group(1),))
+                    new_metrics[new_path].set(value, label_values + (zone_name,))
 
         self.metrics.update(new_metrics)
 
@@ -2300,7 +2392,11 @@ class Module(MgrModule, OrchestratorClientMixin):
                 if service['type'] != 'mgr':
                     continue
                 id_ = service['id']
-                port = self._get_module_option('server_port', DEFAULT_PORT, id_)
+                use_ssl = self._get_module_option('ssl', False, id_)
+                if use_ssl:
+                    port = self._get_module_option('ssl_server_port', DEFAULT_SSL_PORT, id_)
+                else:
+                    port = self._get_module_option('server_port', DEFAULT_PORT, id_)
                 targets.append(f'{hostname}:{port}')
         ret = [
             {
@@ -2309,6 +2405,36 @@ class Module(MgrModule, OrchestratorClientMixin):
             }
         ]
         return 0, json.dumps(ret), ""
+
+    @PrometheusCLICommand.Write('prometheus set-ssl-certificate')
+    def set_ssl_certificate(self, mgr_id: Optional[str] = None, inbuf: Optional[str] = None) -> Tuple[int, str, str]:
+        if inbuf is None:
+            return -errno.EINVAL, '', 'Please specify the certificate with "-i" option'
+        if mgr_id is not None:
+            self.set_store(_get_localized_key(mgr_id, 'crt'), inbuf)
+        else:
+            self.set_store('crt', inbuf)
+        return 0, 'SSL certificate updated', ''
+
+    @PrometheusCLICommand.Write('prometheus set-ssl-certificate-key')
+    def set_ssl_certificate_key(self, mgr_id: Optional[str] = None, inbuf: Optional[str] = None) -> Tuple[int, str, str]:
+        if inbuf is None:
+            return -errno.EINVAL, '', 'Please specify the certificate key with "-i" option'
+        if mgr_id is not None:
+            self.set_store(_get_localized_key(mgr_id, 'key'), inbuf)
+        else:
+            self.set_store('key', inbuf)
+        return 0, 'SSL certificate key updated', ''
+
+    @PrometheusCLICommand.Write('prometheus clear-ssl-certificate')
+    def clear_ssl_certificate(self, mgr_id: Optional[str] = None) -> Tuple[int, str, str]:
+        if mgr_id is not None:
+            self.set_store(_get_localized_key(mgr_id, 'crt'), None)
+            self.set_store(_get_localized_key(mgr_id, 'key'), None)
+        else:
+            self.set_store('crt', None)
+            self.set_store('key', None)
+        return 0, 'SSL certificate and key cleared', ''
 
     def self_test(self) -> None:
         self.collect()
@@ -2330,7 +2456,10 @@ class Module(MgrModule, OrchestratorClientMixin):
                     e
                 )
 
-        # In any error fallback to plain http mode
+        use_ssl = self.get_localized_module_option('ssl', False)
+        if use_ssl:
+            return self.setup_direct_tls_config()
+
         return self.setup_default_config()
 
     def get_cherrypy_config(self) -> Dict[str, Dict[str, Any]]:
@@ -2350,6 +2479,10 @@ class Module(MgrModule, OrchestratorClientMixin):
 
     def setup_default_config(self) -> Tuple[Dict[str, Dict[str, Any]], None, str]:
         return self.get_cherrypy_config(), None, 'http'
+
+    def setup_direct_tls_config(self) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any], str]:
+        ssl_info = _build_ssl_info(self)
+        return self.get_cherrypy_config(), ssl_info, 'https'
 
     def setup_tls_config(self) -> Tuple[Dict[str, Dict[str, Any]], Optional[Dict[str, Any]], str]:
         # Temporarily disabling the verify function due to issues.
@@ -2474,7 +2607,11 @@ class Module(MgrModule, OrchestratorClientMixin):
 
         def start_server() -> cherrypy.process.servers.ServerAdapter:
             server_addr = cast(str, self.get_localized_module_option('server_addr', get_default_addr()))
-            server_port = cast(int, self.get_localized_module_option('server_port', DEFAULT_PORT))
+            use_ssl = self.get_localized_module_option('ssl', False)
+            if use_ssl:
+                server_port = cast(int, self.get_localized_module_option('ssl_server_port', DEFAULT_SSL_PORT))
+            else:
+                server_port = cast(int, self.get_localized_module_option('server_port', DEFAULT_PORT))
 
             config, ssl_info, scheme = self.configure()
             tree = _cptree.Tree()
@@ -2601,10 +2738,23 @@ class StandbyModule(MgrStandbyModule):
     def serve(self) -> None:
         server_addr = cast(str, self.get_localized_module_option(
             'server_addr', get_default_addr()))
-        server_port = cast(int, self.get_localized_module_option(
-            'server_port', DEFAULT_PORT))
+        use_ssl = self.get_localized_module_option('ssl', False)
+        if use_ssl:
+            server_port = cast(int, self.get_localized_module_option(
+                'ssl_server_port', DEFAULT_SSL_PORT))
+        else:
+            server_port = cast(int, self.get_localized_module_option(
+                'server_port', DEFAULT_PORT))
         self.log.info("server_addr: %s server_port: %s" %
                       (server_addr, server_port))
+
+        ssl_info = None
+        if use_ssl:
+            try:
+                ssl_info = _build_ssl_info(self)
+            except Exception as e:
+                self.log.error(f'Failed to start Prometheus standby with TLS: {e}')
+                return
 
         module = self
 
@@ -2647,7 +2797,8 @@ class StandbyModule(MgrStandbyModule):
         self.server_adapter, _ = CherryPyMgr.mount(
             tree,
             'prometheus-standby',
-            (server_addr, int(server_port))
+            (server_addr, int(server_port)),
+            ssl_info=ssl_info
         )
         self.log.info('Engine started.')
 

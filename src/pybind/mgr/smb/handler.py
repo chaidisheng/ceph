@@ -29,6 +29,7 @@ from ceph.fs.earmarking import EarmarkTopScope
 
 from . import config_store, external, resources, rgw
 from .enums import (
+    ACLSupportPolicy,
     AuthMode,
     CephFSStorageProvider,
     HostAccess,
@@ -66,6 +67,7 @@ from .resources import SMBResource
 from .results import ErrorResult, ResourceResult, Result, ResultGroup
 from .rgw_auth import RGWAuthorizer
 from .staging import (
+    CrossCheckToolbox,
     Staging,
     auth_refs,
     cross_check_resource,
@@ -84,6 +86,7 @@ _CLUSTERED = 'clustered'
 _CEPHFS_PROXY = 'cephfs-proxy'
 _REMOTE_CONTROL = 'remote-control'
 _KEYBRIDGE = 'keybridge'
+_ACL_XATTR = 'acl_xattr'
 log = logging.getLogger(__name__)
 
 
@@ -123,6 +126,8 @@ class ClusterChangeGroup:
 class _FakePathResolver:
     """A stub PathResolver for unit testing."""
 
+    _result_resolve_case_sensitivity = (False, False)
+
     def resolve(
         self, volume: str, subvolumegroup: str, subvolume: str, path: str
     ) -> str:
@@ -143,6 +148,11 @@ class _FakePathResolver:
         return f'/{path}'
 
     resolve_exists = resolve
+
+    def resolve_case_sensitivity(
+        self, volume: str, subvolumegroup: str, subvolume: str, path: str
+    ) -> Tuple[bool, bool]:
+        return self._result_resolve_case_sensitivity
 
 
 class ExoResolver:
@@ -401,8 +411,11 @@ class ClusterConfigHandler:
                 len(list(results)),
             )
             with _store_transaction(staging.destination_store):
-                results = staging.save()
+                db_results = staging.save()
+                db_results.merge(results)
+                results = db_results
                 staging.prune_linked_entries()
+            _reconcile_store(staging.destination_store)
             with _store_transaction(staging.destination_store):
                 self._sync_modified(results)
         return results
@@ -495,18 +508,21 @@ class ClusterConfigHandler:
             earmark_resolver = self._choose_earmark_resolver(
                 resource, staging
             )
+            pending_result = ResourceResult.pending(resource)
             cross_check_resource(
                 resource,
                 staging,
-                path_resolver=path_resolver,
-                earmark_resolver=earmark_resolver,
+                toolbox=CrossCheckToolbox(
+                    path_resolver=path_resolver,
+                    earmark_resolver=earmark_resolver,
+                    recorder=pending_result,
+                ),
             )
         except ErrorResult as err:
             log.debug('rejected resource: %r', resource)
             return err
         log.debug('checked resource: %r', resource)
-        result = ResourceResult.checked(resource)
-        return result
+        return ResourceResult.checked_from_result(pending_result)
 
     def _choose_path_resolver(
         self, resource: SMBResource, staging: Staging
@@ -861,6 +877,15 @@ class _ShareConf:
     ceph_cluster: str
     rgw_entity: str = ''
 
+    @property
+    def acl_support(self) -> ACLSupportPolicy:
+        if self.resource.acl_support is not None:
+            return self.resource.acl_support
+        if sd := self.cluster.share_defaults:
+            if sd.acl_support is not None:
+                return sd.acl_support
+        return ACLSupportPolicy.DEFAULT
+
 
 @dataclasses.dataclass(frozen=True)
 class _ClusterConf:
@@ -980,12 +1005,16 @@ def _generate_rgw_share(
     else:
         user_id = cred.user_id or ""
 
+    modules = []
+    if conf.acl_support is ACLSupportPolicy.DEFAULT:
+        modules.append(_ACL_XATTR)
+    modules.append('ceph_rgw')
+
     cfg = {
         # smb.conf options
         'options': {
             'path': '/',
-            'vfs objects': 'acl_xattr ceph_rgw',
-            'acl_xattr:security_acl_name': 'user.NTACL',
+            'vfs objects': ' '.join(modules),
             'ceph_rgw:bucket': rgw.bucket,
             'ceph_rgw:user_id': user_id,
             # Credential values are left empty here; they are injected at
@@ -1001,6 +1030,8 @@ def _generate_rgw_share(
         }
     }
 
+    if _ACL_XATTR in modules:
+        cfg['options']['acl_xattr:security_acl_name'] = 'user.NTACL'
     if share.comment is not None:
         cfg['options']['comment'] = share.comment
     if share.max_connections is not None:
@@ -1059,9 +1090,9 @@ def _generate_share(conf: _ShareConf) -> Dict[str, Dict[str, str]]:
     # Add macOS support modules if enabled
     if conf.cluster.is_macos_compatibility_enabled:
         modules.extend(["fruit", "streams_xattr"])
-
-    # Add standard modules
-    modules.extend(["acl_xattr", "ceph_snapshots"])
+    if conf.acl_support is ACLSupportPolicy.DEFAULT:
+        modules.append(_ACL_XATTR)
+    modules.append("ceph_snapshots")
 
     if qos := cephfs.qos:
         vfs_rl = "aio_ratelimit"
@@ -1074,7 +1105,6 @@ def _generate_share(conf: _ShareConf) -> Dict[str, Dict[str, str]]:
         'options': {
             'path': path,
             "vfs objects": " ".join(modules),
-            'acl_xattr:security_acl_name': 'user.NTACL',
             f'{ceph_vfs}:config_file': ceph_config_file,
             f'{ceph_vfs}:filesystem': cephfs.volume,
             f'{ceph_vfs}:user_id': cephx_entity,
@@ -1087,6 +1117,8 @@ def _generate_share(conf: _ShareConf) -> Dict[str, Dict[str, str]]:
         }
     }
 
+    if _ACL_XATTR in modules:
+        cfg['options']['acl_xattr:security_acl_name'] = 'user.NTACL'
     if qos:
         opts = cfg["options"]
         for field in (
@@ -1661,6 +1693,21 @@ def _store_transaction(store: ConfigStore) -> Iterator[None]:
     log.debug("Using store transaction")
     with transaction():
         yield None
+
+
+def _reconcile_store(store: ConfigStore) -> None:
+    """Fix any mismatches between the store and its mirror copy, if the
+    store supports it.
+    """
+    reconcile = getattr(store, 'reconcile', None)
+    if not reconcile:
+        log.debug("No reconcile support for store")
+        return
+    log.debug("Reconciling store")
+    try:
+        reconcile()
+    except Exception:
+        log.exception("reconcile() failed; continuing")
 
 
 def _has_proxied_vfs(change_group: ClusterChangeGroup) -> bool:

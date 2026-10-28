@@ -24,6 +24,7 @@ from ceph.deployment.service_spec import (
     ServiceSpec,
     YamlLiteralString,
     TunedProfileSpec,
+    MgmtGatewaySpec,
 )
 from ceph.deployment.drive_group import DriveGroupSpec
 from ceph.deployment.hostspec import SpecValidationError
@@ -508,6 +509,8 @@ spec:
   certificate_source: cephadm-signed
   first_virtual_router_id: 50
   frontend_port: 8080
+  haproxy_log_level: info
+  haproxy_log_target: journald
   monitor_cert_source: reuse_service_cert
   monitor_port: 8081
   virtual_ip: 192.168.20.1/24
@@ -653,6 +656,65 @@ def test_nfs_spec_rdma_default():
     assert spec.rdma_port is None
     assert spec.get_port_start() == [2049, 9587, 31311]
     assert spec.get_colocation_port_fields() == ['data_port', 'monitoring_port', 'cluster_qos_port']
+
+
+def test_nfs_spec_kmip_host_list_normalization():
+    """kmip_host_list accepts strings and dicts, normalizing strings to {'addr': ...}."""
+    spec = NFSServiceSpec(
+        service_id='mynfs',
+        kmip_host_list=['kmip.example.com', {'addr': 'kmip2.example.com', 'port': 5696}],
+    )
+    assert spec.kmip_host_list == [
+        {'addr': 'kmip.example.com'},
+        {'addr': 'kmip2.example.com', 'port': 5696},
+    ]
+
+
+@pytest.mark.parametrize('kmip_host_list', [
+    {'addr': 'kmip.example.com'},  # mapping, not a list
+    'kmip.example.com',            # bare string
+    5696,                          # not iterable at all
+])
+def test_nfs_spec_kmip_host_list_must_be_a_list(kmip_host_list):
+    """Non-list kmip_host_list values are rejected instead of being mangled."""
+    with pytest.raises(SpecValidationError, match='kmip_host_list must be a list'):
+        NFSServiceSpec(service_id='mynfs', kmip_host_list=kmip_host_list)
+
+
+def test_nfs_spec_kmip_host_list_invalid_element():
+    """List elements that are neither a string nor a dict are rejected."""
+    with pytest.raises(SpecValidationError, match='kmip_host_list contains an invalid element'):
+        NFSServiceSpec(service_id='mynfs', kmip_host_list=[5696])
+
+
+def _kmip_spec(kmip_host):
+    return NFSServiceSpec(
+        service_id='mynfs',
+        kmip_cert='cert',
+        kmip_key='key',
+        kmip_ca_cert='ca',
+        kmip_host_list=[kmip_host],
+    )
+
+
+@pytest.mark.parametrize('port', [1, 5696, 65535])
+def test_nfs_spec_kmip_host_port_valid(port):
+    """Ports within the 1..65535 range are accepted."""
+    _kmip_spec({'addr': 'kmip.example.com', 'port': port}).validate()
+
+
+@pytest.mark.parametrize('port,error_match', [
+    (0, 'Must be between 1 and 65535'),
+    (-1, 'Must be between 1 and 65535'),
+    (65536, 'Must be between 1 and 65535'),
+    (True, 'Provided port is not valid'),
+    ('5696', 'Provided port is not valid'),
+    (5696.0, 'Provided port is not valid'),
+])
+def test_nfs_spec_kmip_host_port_invalid(port, error_match):
+    """Out of range ports, booleans and non-int ports are rejected."""
+    with pytest.raises(SpecValidationError, match=error_match):
+        _kmip_spec({'addr': 'kmip.example.com', 'port': port}).validate()
 
 
 def test_nfs_spec_rdma_enabled():
@@ -804,6 +866,45 @@ def test_nfs_spec_client_object_cache_validation():
         client_object_cache_size='1MiB',
         client_object_cache_max_dirty='512KiB',
     ).validate()
+
+
+def test_nfs_spec_cephfs_client_log_dir_path():
+    """cephfs_client_log_dir must be an absolute path and not '/' when set."""
+    spec = NFSServiceSpec(
+        service_id='mynfs',
+        placement=PlacementSpec(count=1),
+        enable_cephfs_client_log=True,
+        cephfs_client_log_dir='/var/log/ceph/custom',
+    )
+    spec.validate()
+
+    with pytest.raises(SpecValidationError, match='absolute path'):
+        NFSServiceSpec(
+            service_id='mynfs',
+            placement=PlacementSpec(count=1),
+            enable_cephfs_client_log=True,
+            cephfs_client_log_dir='relative/log/dir',
+        ).validate()
+
+    with pytest.raises(SpecValidationError, match='filesystem root'):
+        NFSServiceSpec(
+            service_id='mynfs',
+            placement=PlacementSpec(count=1),
+            enable_cephfs_client_log=True,
+            cephfs_client_log_dir='/',
+        ).validate()
+
+
+@pytest.mark.parametrize('log_dir', ['//', '/..', '/tmp/..', '/etc', '/var'])
+def test_nfs_spec_cephfs_client_log_dir_rejects_root_aliases(log_dir):
+    """Paths that are, escape to, or name a protected system dir are refused."""
+    with pytest.raises(SpecValidationError):
+        NFSServiceSpec(
+            service_id='mynfs',
+            placement=PlacementSpec(count=1),
+            enable_cephfs_client_log=True,
+            cephfs_client_log_dir=log_dir,
+        ).validate()
 
 
 def test_repr():
@@ -1037,6 +1138,84 @@ spec:
     assert isinstance(loaded, IngressSpec)
     assert loaded.haproxy_peer_communication_port == 5000
     assert loaded.get_port_start() == [2049, 9049, 5000]
+
+
+def _make_ingress_spec(**kwargs):
+    base = dict(
+        service_type='ingress',
+        service_id='rgw.foo',
+        backend_service='rgw.foo',
+        frontend_port=8080,
+        monitor_port=8081,
+        virtual_ip='192.168.1.1/24',
+    )
+    base.update(kwargs)
+    return IngressSpec(**base)
+
+
+def test_ingress_haproxy_logging_defaults():
+    """Logging is on by default: journald target, info level."""
+    spec = _make_ingress_spec()
+    spec.validate()
+    assert spec.haproxy_log_target == 'journald'
+    assert spec.haproxy_log_level == 'info'
+
+
+def test_ingress_haproxy_logging_normalizes_case():
+    """Values are lowercased so they are valid HAProxy tokens."""
+    spec = _make_ingress_spec(haproxy_log_target='JournalD', haproxy_log_level='DEBUG')
+    spec.validate()
+    assert spec.haproxy_log_target == 'journald'
+    assert spec.haproxy_log_level == 'debug'
+
+
+@pytest.mark.parametrize("level", ['debug', 'info', 'notice', 'warning', 'err'])
+def test_ingress_haproxy_log_level_accepts_valid(level):
+    spec = _make_ingress_spec(haproxy_log_level=level)
+    spec.validate()
+    assert spec.haproxy_log_level == level
+
+
+@pytest.mark.parametrize("target", ['journald', 'none'])
+def test_ingress_haproxy_log_target_accepts_valid(target):
+    spec = _make_ingress_spec(haproxy_log_target=target)
+    spec.validate()
+    assert spec.haproxy_log_target == target
+
+
+def test_ingress_haproxy_log_level_rejects_invalid():
+    spec = _make_ingress_spec(haproxy_log_level='verbose')
+    with pytest.raises(SpecValidationError, match='haproxy_log_level'):
+        spec.validate()
+
+
+def test_ingress_haproxy_log_target_rejects_invalid():
+    spec = _make_ingress_spec(haproxy_log_target='syslog')
+    with pytest.raises(SpecValidationError, match='haproxy_log_target'):
+        spec.validate()
+
+
+@pytest.mark.parametrize("value", [None, '', '   '])
+def test_ingress_haproxy_logging_unset_uses_default(value):
+    """None and empty/whitespace strings fall back to the defaults."""
+    spec = _make_ingress_spec(haproxy_log_target=value, haproxy_log_level=value)
+    spec.validate()
+    assert spec.haproxy_log_target == 'journald'
+    assert spec.haproxy_log_level == 'info'
+
+
+@pytest.mark.parametrize("bad", [False, 0, [], True, 5, ['journald']])
+def test_ingress_haproxy_log_target_rejects_non_string(bad):
+    """Non-string values are rejected with a clear error, not silently
+    coerced to the default (false/0/[]) nor crashed on .lower() (true/5/list)."""
+    with pytest.raises(SpecValidationError, match='haproxy_log_target must be a string'):
+        _make_ingress_spec(haproxy_log_target=bad)
+
+
+@pytest.mark.parametrize("bad", [False, 0, [], True, 5, ['info']])
+def test_ingress_haproxy_log_level_rejects_non_string(bad):
+    with pytest.raises(SpecValidationError, match='haproxy_log_level must be a string'):
+        _make_ingress_spec(haproxy_log_level=bad)
 
 
 @pytest.mark.parametrize("y, error_match", [
@@ -1807,3 +1986,26 @@ def test_tuned_profile_spec_profile_name_validation(spec_yaml, expect_error, err
         assert spec.placement is not None
         # round-trip
         assert TunedProfileSpec.from_json(spec.to_json()).profile_name == spec.profile_name
+
+@pytest.mark.parametrize(
+    "virtual_ip, valid",
+    [
+        ("10.128.8.255", True),
+        ("2001:db8::1", True),
+        ("[2001:db8::1]", True),
+        ("ceph.example.com", False),
+        ("10.128.8.255/22", False),
+        ("invalid", False),
+    ],
+)
+def test_mgmt_gateway_virtual_ip_validation(virtual_ip, valid):
+    spec = MgmtGatewaySpec(virtual_ip=virtual_ip)
+
+    if valid:
+        spec.validate()
+    else:
+        with pytest.raises(
+            SpecValidationError,
+            match=r"Invalid virtual_ip: .*\. Must be a valid IP address\.",
+        ):
+            spec.validate()
