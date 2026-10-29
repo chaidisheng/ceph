@@ -443,7 +443,8 @@ class RGWRados
   int get_obj_state_impl(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx,
                          RGWBucketInfo& bucket_info, const rgw_obj& obj,
                          RGWObjStateManifest** psm, bool follow_olh,
-                         optional_yield y, bool assume_noent = false);
+                         optional_yield y, bool assume_noent = false,
+                         const rgw_placement_rule *placement_rule = nullptr);
   int append_atomic_test(const DoutPrefixProvider *dpp, RGWObjectCtx* rctx, RGWBucketInfo& bucket_info, const rgw_obj& obj,
                          librados::ObjectOperation& op, RGWObjState **state,
 			 RGWObjManifest** pmanifest, optional_yield y);
@@ -1321,7 +1322,8 @@ public:
                const DoutPrefixProvider *dpp,
                optional_yield y,
                uint64_t src_accounted_size = 0,
-               bool log_op = true);
+               bool log_op = true,
+               bool *pcanceled = nullptr);
 
   int transition_obj(RGWObjectCtx& obj_ctx,
                      RGWBucketInfo& bucket_info,
@@ -1407,7 +1409,8 @@ int restore_obj_from_cloud(RGWLCCloudTierCtx& tier_ctx,
   int get_obj_state(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx,
                     RGWBucketInfo& bucket_info, const rgw_obj& obj,
                     RGWObjStateManifest** psm, bool follow_olh,
-                    optional_yield y, bool assume_noent = false);
+                    optional_yield y, bool assume_noent = false,
+                    const rgw_placement_rule *placement_rule = nullptr);
 
   int get_obj_state(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx,
                     RGWBucketInfo& bucket_info, const rgw_obj& obj,

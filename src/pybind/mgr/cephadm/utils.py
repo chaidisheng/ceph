@@ -79,6 +79,40 @@ ROTATION_CIPHER = 'aes256k'
 SERVICE_CIPHER = 'aes256k'
 
 
+def auth_allowed_cipher_names_from_mon_map(mon_map: Any) -> List[str]:
+    """Return auth_allowed_ciphers names from a MonMap dump (mgr get('mon_map')).
+    """
+    if not isinstance(mon_map, dict):
+        return []
+    raw = mon_map.get('auth_allowed_ciphers')
+    if not isinstance(raw, list):
+        return []
+    names: List[str] = []
+    for item in raw:
+        name = item.get('name') if isinstance(item, dict) else None
+        if name:
+            names.append(str(name))
+    return names
+
+
+def allowed_ciphers_are_aes256k_only(cipher_names: List[str]) -> bool:
+    """True when allowed ciphers are already restricted to aes256k (no legacy aes)."""
+    names = {name.strip() for name in cipher_names if name and name.strip()}
+    return names == {ROTATION_CIPHER}
+
+
+def auth_service_cipher_name_from_mon_map(mon_map: Any) -> Optional[str]:
+    """Return the auth_service_cipher name from a MonMap dump (mgr get('mon_map')).
+    """
+    if not isinstance(mon_map, dict):
+        return None
+    raw = mon_map.get('auth_service_cipher')
+    if not isinstance(raw, dict):
+        return None
+    name = raw.get('name')
+    return str(name) if name else None
+
+
 DEFAULT_SSH_CONFIG = """
 Host *
   User root
@@ -310,3 +344,18 @@ def get_default_ssh_config() -> str:
         ssh_config += f'  Ciphers {FIPS_SSH_CIPHERS}\n'
 
     return ssh_config
+
+
+def build_ceph_volume_cmd(
+    log_level: str,
+    command: List[str],
+    prefix: Optional[List[str]] = None,
+) -> List[str]:
+    """Build ceph-volume argv after cephadm's '--' separator.
+
+    prefix is for flags that must appear before '--' (e.g. --config-json).
+    """
+    cmd: List[str] = list(prefix or [])
+    cmd.extend(['--', '--log-level', log_level])
+    cmd.extend(command)
+    return cmd

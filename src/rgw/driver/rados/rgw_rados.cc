@@ -8,6 +8,7 @@
 #include <sstream>
 
 #include <boost/algorithm/string.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <string_view>
 
 #include <boost/container/flat_set.hpp>
@@ -5638,7 +5639,8 @@ int RGWRados::copy_obj_data(RGWObjectCtx& obj_ctx,
                const DoutPrefixProvider *dpp,
                optional_yield y,
                uint64_t src_accounted_size,
-               bool log_op)
+               bool log_op,
+               bool *pcanceled)
 {
   string tag;
   append_rand_alpha(cct, tag, tag, 32);
@@ -5719,10 +5721,27 @@ int RGWRados::copy_obj_data(RGWObjectCtx& obj_ctx,
     accounted_size = dp_factory->get_accounted_size(accounted_size);
   }
 
+  // for testing: hold the copy after reading the source and before writing
+  // the head, to reproduce a race with a concurrent overwrite
+  if (cct->_conf->rgw_inject_delay_sec > 0 &&
+      std::string_view(cct->_conf->rgw_inject_delay_pattern) == "delay_copy_obj_data_complete") {
+    ldpp_dout(dpp, 0) << __func__ << ": injecting delay of " << cct->_conf->rgw_inject_delay_sec
+                      << "s for " << dest_obj << dendl;
+    const auto delay = ceph::make_timespan(cct->_conf->rgw_inject_delay_sec);
+    if (y) {
+      auto yield = y.get_yield_context();
+      boost::asio::steady_timer timer{yield.get_executor(), delay};
+      boost::system::error_code ec;
+      timer.async_wait(yield[ec]);
+    } else {
+      std::this_thread::sleep_for(delay);
+    }
+  }
+
   const req_context rctx{dpp, y, nullptr};
   return aoproc.complete(accounted_size, etag, mtime, set_mtime, attrs,
 			    rgw::cksum::no_cksum, delete_at,
-                            nullptr, nullptr, nullptr, nullptr, nullptr, rctx,
+                            nullptr, nullptr, nullptr, nullptr, pcanceled, rctx,
                             log_op ? rgw::sal::FLAG_LOG_OP : 0);
 }
 
@@ -5972,6 +5991,7 @@ int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
         << dendl;
   }
 
+  bool canceled = false;
   ret = copy_obj_data(obj_ctx,
                       owner,
                       bucket_info,
@@ -5989,9 +6009,14 @@ int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
                       dpp,
                       y,
                       0, /* src_accounted_size: unknown here, keep ofs-based size */
-                      log_op);
+                      log_op,
+                      &canceled);
   if (ret < 0) {
     return ret;
+  }
+  if (canceled) {
+    // the object was overwritten or removed while it was transitioning
+    return -ECANCELED;
   }
 
   return 0;
@@ -7456,7 +7481,8 @@ int RGWRados::get_olh_target_state(const DoutPrefixProvider *dpp, RGWObjectCtx&
 int RGWRados::get_obj_state_impl(const DoutPrefixProvider *dpp, RGWObjectCtx *octx,
                                  RGWBucketInfo& bucket_info, const rgw_obj& obj,
                                  RGWObjStateManifest** psm, bool follow_olh,
-                                 optional_yield y, bool assume_noent)
+                                 optional_yield y, bool assume_noent,
+                                 const rgw_placement_rule *placement_rule)
 {
   if (obj.empty()) {
     return -EINVAL;
@@ -7478,7 +7504,8 @@ int RGWRados::get_obj_state_impl(const DoutPrefixProvider *dpp, RGWObjectCtx *oc
   s->obj = obj;
 
   rgw_raw_obj raw_obj;
-  obj_to_raw(bucket_info.placement_rule, obj, &raw_obj);
+  // use the caller's placement rule if given (e.g. a multipart part's tail placement)
+  obj_to_raw(placement_rule ? *placement_rule : bucket_info.placement_rule, obj, &raw_obj);
 
   int r = -ENOENT;
 
@@ -7655,14 +7682,15 @@ int RGWRados::get_obj_state_impl(const DoutPrefixProvider *dpp, RGWObjectCtx *oc
 int RGWRados::get_obj_state(const DoutPrefixProvider *dpp, RGWObjectCtx *octx,
                             RGWBucketInfo& bucket_info, const rgw_obj& obj,
                             RGWObjStateManifest** psm, bool follow_olh,
-                            optional_yield y, bool assume_noent)
+                            optional_yield y, bool assume_noent,
+                            const rgw_placement_rule *placement_rule)
 {
   int ret;
   unsigned attempts = 0;
 
   do {
     ret = get_obj_state_impl(dpp, octx, bucket_info, obj, psm,
-                             follow_olh, y, assume_noent);
+                             follow_olh, y, assume_noent, placement_rule);
   } while (ret == -EAGAIN && ++attempts < 5);
 
   return ret == -EAGAIN ? -ERR_SERVICE_UNAVAILABLE : ret;
@@ -8281,11 +8309,27 @@ int RGWRados::get_part_obj_state(const DoutPrefixProvider* dpp, optional_yield y
   }
   RGWObjStateManifest* sm = nullptr;
   constexpr bool follow_olh = false; // parts aren't versioned
+  // the part head is written with the upload's tail placement
+  const rgw_placement_rule& part_placement = manifest->get_tail_placement().placement_rule;
   int r = store->get_obj_state(dpp, rctx, bucket_info, *head_obj,
-                               &sm, follow_olh, y);
+                               &sm, follow_olh, y, false, &part_placement);
   if (r < 0) {
     return r;
   }
+
+  // for backward compatibility:
+  //   parts written before tracker #49128 (v16.2.8) have their head attrs in a zero-size object
+  //   in the bucket's default pool, and their data in the tail placement's pool without attrs
+  if (part_placement != bucket_info.placement_rule &&
+      (!sm->state.exists || !sm->state.attrset.count(RGW_ATTR_ETAG))) {
+    rctx->invalidate(*head_obj);
+    r = store->get_obj_state(dpp, rctx, bucket_info, *head_obj,
+                             &sm, follow_olh, y);
+    if (r < 0) {
+      return r;
+    }
+  }
+
   *pstate = &sm->state;
 
   // if the part has its own manifest, use it directly
