@@ -236,6 +236,8 @@ class NFSCluster:
             enable_rdma: bool = False,
             rdma_port: Optional[int] = None,
             ingress_placement: Optional[str] = None,
+            networks: Optional[List[str]] = None,
+            clients_per_pool: Optional[int] = None,
     ) -> None:
         if not port:
             port = 2049   # default nfs port
@@ -258,14 +260,14 @@ class NFSCluster:
             virtual_ip_for_ganesha: Optional[str] = None
             keepalive_only: bool = False
             enable_haproxy_protocol: bool = False
-            if ingress_mode != IngressType.haproxy_standard:
-                virtual_ip_for_ganesha = virtual_ip.split('/')[0]
             if ingress_mode == IngressType.haproxy_protocol:
                 enable_haproxy_protocol = True
             elif ingress_mode == IngressType.keepalive_only:
                 keepalive_only = True
+                virtual_ip_for_ganesha = virtual_ip.split('/')[0]
                 ganesha_port = port
                 frontend_port = None
+
             spec = NFSServiceSpec(service_type='nfs', service_id=cluster_id,
                                   placement=pspec,
                                   # use non-default port so we don't conflict with ingress
@@ -291,7 +293,9 @@ class NFSCluster:
                                   monitoring_ip_addrs=monitoring_ip_addrs,
                                   monitoring_port=monitoring_port,
                                   enable_rdma=enable_rdma,
-                                  rdma_port=rdma_port)
+                                  rdma_port=rdma_port,
+                                  networks=networks,
+                                  clients_per_pool=clients_per_pool)
             completion = self.mgr.apply_nfs(spec)
             orchestrator.raise_if_exception(completion)
             ispec = IngressSpec(service_type='ingress',
@@ -329,7 +333,9 @@ class NFSCluster:
                                   monitoring_ip_addrs=monitoring_ip_addrs,
                                   monitoring_port=monitoring_port,
                                   enable_rdma=enable_rdma,
-                                  rdma_port=rdma_port)
+                                  rdma_port=rdma_port,
+                                  networks=networks,
+                                  clients_per_pool=clients_per_pool)
             completion = self.mgr.apply_nfs(spec)
             orchestrator.raise_if_exception(completion)
         log.debug("Successfully deployed nfs daemons with cluster id %s and placement %s",
@@ -374,6 +380,8 @@ class NFSCluster:
             enable_rdma: bool = False,
             rdma_port: Optional[int] = None,
             ingress_placement: Optional[str] = None,
+            networks: Optional[List[str]] = None,
+            clients_per_pool: Optional[int] = None,
     ) -> None:
         try:
             if virtual_ip:
@@ -387,6 +395,12 @@ class NFSCluster:
                 raise NFSInvalidOperation('ingress currently requires a virtual_ip')
             if ingress_mode and not ingress:
                 raise NFSInvalidOperation('--ingress-mode must be passed along with --ingress')
+            if ingress_mode == IngressType.keepalive_only \
+                    and (networks or ip_addrs):
+                raise NFSInvalidOperation(
+                    'networks and bind addresses cannot be used with keepalive-only '
+                    'ingress mode; they conflict with virtual_ip'
+                )
             invalid_str = re.search('[^A-Za-z0-9-_.]', cluster_id)
             if invalid_str:
                 raise NFSInvalidOperation(f"cluster id {cluster_id} is invalid. "
@@ -397,34 +411,45 @@ class NFSCluster:
             self.create_empty_rados_obj(cluster_id)
 
             if cluster_id not in available_clusters(self.mgr):
-                self._call_orch_apply_nfs(
-                    cluster_id,
-                    placement,
-                    virtual_ip,
-                    ingress_mode,
-                    port,
-                    cluster_qos_config=cluster_qos_config,
-                    enable_nfsv3=enable_nfsv3,
-                    enable_nfs_metrics=enable_nfs_metrics,
-                    kmip_cert=kmip_cert,
-                    kmip_key=kmip_key,
-                    kmip_ca_cert=kmip_ca_cert,
-                    kmip_host_list=kmip_host_list,
-                    ssl=ssl,
-                    ssl_cert=ssl_cert,
-                    ssl_key=ssl_key,
-                    ssl_ca_cert=ssl_ca_cert,
-                    tls_ktls=tls_ktls,
-                    tls_debug=tls_debug,
-                    tls_min_version=tls_min_version,
-                    tls_ciphers=tls_ciphers,
-                    ip_addrs=ip_addrs,
-                    monitoring_ip_addrs=monitoring_ip_addrs,
-                    monitoring_port=monitoring_port,
-                    enable_rdma=enable_rdma,
-                    rdma_port=rdma_port,
-                    ingress_placement=ingress_placement
-                )
+                try:
+                    self._call_orch_apply_nfs(
+                        cluster_id,
+                        placement,
+                        virtual_ip,
+                        ingress_mode,
+                        port,
+                        cluster_qos_config=cluster_qos_config,
+                        enable_nfsv3=enable_nfsv3,
+                        enable_nfs_metrics=enable_nfs_metrics,
+                        kmip_cert=kmip_cert,
+                        kmip_key=kmip_key,
+                        kmip_ca_cert=kmip_ca_cert,
+                        kmip_host_list=kmip_host_list,
+                        ssl=ssl,
+                        ssl_cert=ssl_cert,
+                        ssl_key=ssl_key,
+                        ssl_ca_cert=ssl_ca_cert,
+                        tls_ktls=tls_ktls,
+                        tls_debug=tls_debug,
+                        tls_min_version=tls_min_version,
+                        tls_ciphers=tls_ciphers,
+                        ip_addrs=ip_addrs,
+                        monitoring_ip_addrs=monitoring_ip_addrs,
+                        monitoring_port=monitoring_port,
+                        enable_rdma=enable_rdma,
+                        rdma_port=rdma_port,
+                        ingress_placement=ingress_placement,
+                        networks=networks,
+                        clients_per_pool=clients_per_pool
+                    )
+                except Exception:
+                    try:
+                        self.delete_config_obj(cluster_id)
+                    except Exception:
+                        log.exception(
+                            "Failed to clean up rados objects after NFS cluster "
+                            "create failure for %s", cluster_id)
+                    raise
                 return
             raise NonFatalError(f"{cluster_id} cluster already exists")
         except Exception as e:
@@ -440,18 +465,33 @@ class NFSCluster:
                 orchestrator.raise_if_exception(completion)
                 completion = self.mgr.remove_service('nfs.' + cluster_id)
                 orchestrator.raise_if_exception(completion)
-                self.delete_config_obj(cluster_id)
-                return
             # The NFS service may have already been removed via 'ceph orch rm'.
             # Check if orphaned RADOS config objects remain and clean them up.
-            if self._rados(cluster_id).has_objects():
+            elif self._rados(cluster_id).has_objects():
                 log.warning(
                     f"NFS cluster '{cluster_id}' not found in orchestrator but RADOS objects "
                     f"still exist. Cleaning up orphaned objects."
                 )
+            else:
+                raise NonFatalError("Cluster does not exist")
+            export_mgr = self.mgr.export_mgr
+            with export_mgr._ceph_users_locked(cluster_id):
+                # A cluster taken down through its exports has already retired
+                # its pool users. One whose service went away under 'ceph orch
+                # rm' never ran that path, so its CephX users are still around
+                # and the CEPH_USERS object naming them is about to go with
+                # the rest of the namespace. Retire them while it can still be
+                # read, or nothing records them again.
+                ceph_users = export_mgr._read_ceph_users(cluster_id)
+                if ceph_users and ceph_users.users:
+                    export_mgr._remove_pool_users(ceph_users.users)
                 self.delete_config_obj(cluster_id)
-                return
-            raise NonFatalError("Cluster does not exist")
+            # The lock _ceph_users_locked() made for this cluster stays in
+            # its registry. Dropping it would race: a caller that resolved
+            # the lock but has not taken it yet would hold one the registry
+            # no longer has, and the next caller would make a second one and
+            # run beside it. Keeping it costs an RLock per cluster id the mgr
+            # has served, and that goes with the mgr.
         except Exception as e:
             log.exception(f"Failed to delete NFS Cluster {cluster_id}")
             raise ErrorResponse.wrap(e)
@@ -575,7 +615,8 @@ class NFSCluster:
                     )
                     if stale:
                         problems.append(
-                            f"exports left with a pre-rotation keyring: {', '.join(stale)}")
+                            "exports or client-pool users left with a "
+                            f"pre-rotation keyring: {', '.join(stale)}")
                 except Exception as e:
                     log.exception("Failed to refresh exports of cluster %s", cluster_id)
                     problems.append(f"failed to refresh export keyrings: {e}")
@@ -630,11 +671,13 @@ class NFSCluster:
         placement, and ingress configuration.
         """
         # Get all NFS daemons
-        completion = self.mgr.list_daemons(daemon_type='nfs')
-        all_nfs_daemons = orchestrator.raise_if_exception(completion)
-
-        # Filter daemons for this cluster
-        cluster_daemons = [d for d in all_nfs_daemons if d.service_id() == cluster_id]
+        cluster_daemons = []
+        try:
+            completion = self.mgr.list_daemons(daemon_type='nfs')
+            all_nfs_daemons = orchestrator.raise_if_exception(completion) or []
+            cluster_daemons = [d for d in all_nfs_daemons if d.service_id() == cluster_id]
+        except orchestrator.OrchestratorError:
+            log.debug("Failed to list NFS daemons for cluster %s", cluster_id)
 
         # Cache hosts data to avoid O(n) orchestrator calls
         hosts_map = {}
@@ -708,25 +751,16 @@ class NFSCluster:
         placement = None
         enable_nfsv3 = False
         enable_rdma = False
+        enable_nfs_metrics = False
+        clients_per_pool = None
 
-        # Use live describe_service output, not export matching, for the current cluster config.
         nfs_spec = get_nfs_spec_for_cluster(self.mgr, cluster_id)
         if nfs_spec:
             placement = nfs_spec.placement
+            enable_nfsv3 = bool(getattr(nfs_spec, 'enable_nfsv3', False))
             enable_rdma = bool(getattr(nfs_spec, 'enable_rdma', False))
-
-        # Read the live NFS service spec from the orchestrator to reflect the current cluster config.
-        nfs_sc = self.mgr.describe_service(
-            service_type='nfs',
-            service_name=f'nfs.{cluster_id}'
-        )
-        nfs_services = orchestrator.raise_if_exception(nfs_sc)
-        for svc in nfs_services:
-            if svc.spec.service_id == cluster_id:
-                placement = svc.spec.placement
-                enable_nfsv3 = bool(getattr(svc.spec, 'enable_nfsv3', False))
-                enable_rdma = bool(getattr(svc.spec, 'enable_rdma', False))
-                break
+            enable_nfs_metrics = bool(getattr(nfs_spec, 'enable_nfs_metrics', False))
+            clients_per_pool = getattr(nfs_spec, 'clients_per_pool', None)
 
         if ingress_mode:
             if placement and placement.count and placement.count > 1:
@@ -743,6 +777,7 @@ class NFSCluster:
             'placement': placement.to_json() if placement else {},
             'enable_nfsv3': enable_nfsv3,
             'enable_rdma': enable_rdma,
+            'enable_nfs_metrics': enable_nfs_metrics,
         }
 
         if ingress_mode:
@@ -751,6 +786,8 @@ class NFSCluster:
             r['port'] = ingress_port
         if monitor_port is not None:
             r['monitor_port'] = monitor_port
+        if clients_per_pool is not None:
+            r['clients_per_pool'] = clients_per_pool
 
         log.debug("Successfully fetched %s info: %s", cluster_id, r)
         return r
@@ -765,10 +802,15 @@ class NFSCluster:
             else:
                 cluster_ls = available_clusters(self.mgr)
 
-            for cluster_id in cluster_ls:
-                res = self._show_nfs_cluster_info(cluster_id)
-                if res:
-                    info_res[cluster_id] = res
+            for cid in cluster_ls:
+                try:
+                    res = self._show_nfs_cluster_info(cid)
+                    if res:
+                        info_res[cid] = res
+                except Exception as e:
+                    log.exception("Failed to show info for NFS cluster %s", cid)
+                    # Still surface the cluster in listings even if details fail
+                    info_res[cid] = {'backend': [], 'placement': {}, 'error': str(e)}
             return info_res
         except Exception as e:
             log.exception("Failed to show info for cluster")

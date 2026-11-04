@@ -146,6 +146,34 @@ class NFSService(CephService):
 
         assert self.TYPE == spec.service_type
         create_ganesha_pool(self.mgr)
+        self._reconcile_client_pool(spec)
+
+    def _reconcile_client_pool(self, spec: NFSServiceSpec) -> None:
+        """Have the nfs module size the CephFS client pool to the spec.
+
+        Pool users are normally provisioned by the first cmount_path=/ export
+        of a filesystem. A cluster that enables or raises clients_per_pool
+        when those exports already exist has no such trigger, so the pools are
+        topped up from here instead.
+
+        config() runs once per apply, ahead of every path that can write a
+        ganesha.conf, so raising here keeps clients_per_pool out of a config
+        the CEPH_USERS object cannot back.
+        """
+        clients_per_pool = spec.clients_per_pool
+        if not clients_per_pool or not spec.service_id:
+            return
+        service_name = spec.service_name()
+        try:
+            created = self.mgr.remote('nfs', 'reconcile_client_pool',
+                                      spec.service_id, clients_per_pool)
+        except Exception as e:
+            raise OrchestratorError(
+                f'Cannot size the CephFS client pool of {service_name} to '
+                f'{clients_per_pool}: {e}') from e
+        if created:
+            logger.info('Added CephFS client pool users to %s: %s',
+                        service_name, created)
 
     @classmethod
     def _get_service_dependencies(
@@ -204,6 +232,10 @@ class NFSService(CephService):
                 )
         if nfs_spec.mem_stats_disable:
             deps.append(f'mem_stats_disable: {nfs_spec.mem_stats_disable}')
+        # CephFS client pool: the size reaches Ganesha through ganesha.conf,
+        # so a pool that is enabled or grown has to reconfigure the daemons.
+        if nfs_spec.clients_per_pool is not None:
+            deps.append(f'clients_per_pool: {nfs_spec.clients_per_pool}')
 
         return sorted(deps)
 
@@ -229,11 +261,20 @@ class NFSService(CephService):
         return f'{service_name}'
 
     @staticmethod
-    def _cephfs_client_log_ceph_conf(spec: NFSServiceSpec) -> Optional[str]:
-        if not spec.enable_cephfs_client_log:
-            return None
-        level = 10 if spec.cephfs_client_log_level is None else spec.cephfs_client_log_level
-        return f'\n[client]\n\tdebug client = {level}\n\tlog file = /var/log/ceph/$name.$pid.log\n'
+    def _extra_ceph_conf(spec: NFSServiceSpec) -> Optional[str]:
+        strand = spec.objecter_dispatch_to_session_strand
+
+        conf_lines = [
+            '[client]',
+            f'\tobjecter_dispatch_to_session_strand = {str(strand).lower()}',
+        ]
+
+        if spec.enable_cephfs_client_log:
+            level = 10 if spec.cephfs_client_log_level is None else spec.cephfs_client_log_level
+            conf_lines.append(f'\tdebug client = {level}')
+            conf_lines.append('\tlog file = /var/log/ceph/$name.$pid.log')
+
+        return '\n'.join(conf_lines) + '\n'
 
     def _get_cephfs_client_log_dir(self, spec: NFSServiceSpec) -> str:
         if spec.cephfs_client_log_dir:
@@ -428,6 +469,7 @@ class NFSService(CephService):
                     if nfs_spec.client_object_cache_max_dirty is not None else None
                 ),
                 "mem_stats_disable": nfs_spec.mem_stats_disable,
+                "clients_per_pool": nfs_spec.clients_per_pool,
             }
             if nfs_spec.enable_haproxy_protocol:
                 context["haproxy_hosts"] = self._haproxy_hosts()
@@ -487,7 +529,7 @@ class NFSService(CephService):
                     daemon_type, daemon_id,
                     keyring=rados_keyring,
                     host=host,
-                    extra_ceph_config=self._cephfs_client_log_ceph_conf(nfs_spec),
+                    extra_ceph_config=self._extra_ceph_conf(nfs_spec),
                 )
             )
             if nfs_spec.enable_cephfs_client_log:

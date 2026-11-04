@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <string>
+#include <shared_mutex>
 
 #include <unistd.h>
 
@@ -2767,11 +2768,12 @@ void RadosStore::get_quota(RGWQuota& quota)
     quota.user_quota = svc()->quota->get_user_quota();
 }
 
-void RadosStore::get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& anon_ratelimit)
+void RadosStore::get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& account_ratelimit, RGWRateLimitInfo& anon_ratelimit)
 {
   bucket_ratelimit = svc()->zone->get_current_period().get_config().bucket_ratelimit;
   user_ratelimit = svc()->zone->get_current_period().get_config().user_ratelimit;
   anon_ratelimit = svc()->zone->get_current_period().get_config().anon_ratelimit;
+  account_ratelimit = svc()->zone->get_current_period().get_config().account_ratelimit;
 }
 
 int RadosStore::set_buckets_enabled(const DoutPrefixProvider* dpp, vector<rgw_bucket>& buckets, bool enabled, optional_yield y)
@@ -3238,15 +3240,12 @@ int RadosObject::set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs, A
 {
   Attrs empty;
   const bool log_op = flags & rgw::sal::FLAG_LOG_OP;
-  // make a tiny adjustment to the existing mtime so that fetch_remote_obj()
-  // won't return ERR_NOT_MODIFIED when syncing the modified object
-  const auto mtime = log_op ? state.mtime + ceph::timespan{std::chrono::nanoseconds{1}} : state.mtime;
   return store->getRados()->set_attrs(dpp, rados_ctx,
 			bucket->get_info(),
 			get_obj(),
 			setattrs ? *setattrs : empty,
 			delattrs ? delattrs : nullptr,
-			y, log_op, mtime);
+			y, log_op);
 }
 
 int RadosObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp)
@@ -5768,6 +5767,7 @@ RadosLuaManager::RadosLuaManager(RadosStore* _s, const std::string& _luarocks_pa
 }
 
 uint64_t RadosLuaManager::get_watch_handle_for_script(const std::string& script_oid) {
+  std::shared_lock<std::shared_mutex> lock(watch_mutex);
   auto search = script_watches.find(script_oid);
   if (search != script_watches.end()) {
     return search->second;
@@ -5776,6 +5776,7 @@ uint64_t RadosLuaManager::get_watch_handle_for_script(const std::string& script_
 }
 
 std::string RadosLuaManager::get_script_for_watch_handle(uint64_t handle) {
+  std::shared_lock<std::shared_mutex> lock(watch_mutex);
   auto search = reverse_script_watches.find(handle);
   if (search != reverse_script_watches.end()) {
     return search->second;
@@ -5794,16 +5795,18 @@ int RadosLuaManager::watch_script(const DoutPrefixProvider* dpp, const std::stri
     if (r < 0) {
       ldpp_dout(dpp, 1) << "ERROR: failed to watch " << script_oid
                         << ". error: " << cpp_strerror(r) << dendl;
-      if (r == -ENOENT) {
-        // Let the background thread know to update the script cache
+      // Let the background thread know to update the script cache
+      if (lua_background) {
         lua_background->process_script_add(script_oid);
       }
-    // Return error?
       return r;
     }
     ldpp_dout(dpp, 20) << "INFO: inited watch on " << script_oid  << " with handle " << w_handle << dendl;
-    script_watches.emplace(script_oid, w_handle);
-    reverse_script_watches.emplace(w_handle, script_oid);
+    {
+      std::lock_guard<std::shared_mutex> lock(watch_mutex);
+      script_watches.emplace(script_oid, w_handle);
+      reverse_script_watches.emplace(w_handle, script_oid);
+    }
   }
   return 0;
 }
@@ -5828,10 +5831,11 @@ int RadosLuaManager::unwatch_script(const DoutPrefixProvider* dpp, const std::st
         << ". error: " << cpp_strerror(r) << dendl;
     return r;
   }
-
-  script_watches.erase(script_oid);
-  reverse_script_watches.erase(w_handle);
-
+  {
+    std::lock_guard<std::shared_mutex> lock(watch_mutex);
+    script_watches.erase(script_oid);
+    reverse_script_watches.erase(w_handle);
+  }
   ldpp_dout(dpp, 20) << "Stopped watching for updates of Lua script " << script_oid
     << " with handle: " << w_handle << dendl;
 
@@ -5898,7 +5902,6 @@ std::tuple<rgw::lua::LuaCodeType, int> RadosLuaManager::get_script_or_bytecode(c
                       <<  ", error = " << err.what() << dendl;
     return std::make_tuple("", -EIO);
   }
-
   r = watch_script(dpp, key);
   if (r < 0) {
     ldpp_dout(dpp, 10) << "WARNING: failed to watch Lua script: " << key << ", err:"
@@ -6291,6 +6294,10 @@ void RadosLuaManager::ScriptsWatcher::handle_error(uint64_t cookie, int err)
     ldpp_dout(this, 5) << "ERROR: failed to find the script for watch handle: "
                        << cookie << dendl;
     return;
+  }
+
+  if (parent->lua_background) {
+    parent->lua_background->process_script_add(script_oid);
   }
   ldpp_dout(this, 5) << "WARNING: restarting watch handler for script: "
                      << script_oid << ", err:" << err << dendl;

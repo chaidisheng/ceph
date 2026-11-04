@@ -206,6 +206,12 @@ def ceph_log(ctx, config):
                             err = p.stderr.getvalue()
                             if 'error: error renaming temp state file' in err:
                                 log.info('ignoring transient state error: %s', e)
+                            elif 'is already locked' in err:
+                                # The distro's daily logrotate run holds the
+                                # state file lock. It rotates our logs too (it
+                                # includes /etc/logrotate.d), so skip this
+                                # round instead of failing the job.
+                                log.info('ignoring concurrent logrotate: %s', e)
                             else:
                                 raise
                 except socket.error as e:
@@ -583,11 +589,24 @@ def ceph_clients(ctx, config):
 
 @contextlib.contextmanager
 def watchdog_setup(ctx, config):
-    ctx.ceph[config['cluster']].thrashers = []
-    ctx.ceph[config['cluster']].watched_processes = []
-    ctx.ceph[config['cluster']].watchdog = DaemonWatchdog(ctx, config)
-    ctx.ceph[config['cluster']].watchdog.start()
-    yield
+    cluster = config['cluster']
+    thrashers = []
+    ctx.ceph[cluster].thrashers = thrashers
+    ctx.ceph[cluster].watched_processes = []
+    watchdog = DaemonWatchdog(ctx, config)
+    ctx.ceph[cluster].watchdog = watchdog
+    watchdog.start()
+    try:
+        yield
+    finally:
+        log.info("Tearing down thrashers...")
+        for thrasher in thrashers:
+            thrasher.stop()
+        for thrasher in thrashers:
+            thrasher.join()
+        log.info("Tearing down watchdog...")
+        watchdog.stop()
+        watchdog.join()
 
 def get_mons(roles, ips, cluster_name,
              mon_bind_msgr2=False,

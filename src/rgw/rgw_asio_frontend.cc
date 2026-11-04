@@ -348,11 +348,12 @@ void handle_connection(boost::asio::io_context& context,
         client_env.set("TLS_VERSION", tls_version);
       }
       int http_ret = 0;
+      uint64_t rdma_bytes = 0;
       string user = "-";
       const auto started = ceph::coarse_real_clock::now();
       ceph::coarse_real_clock::duration latency{};
       process_request(env, &req, uri_prefix, &client, y,
-                      scheduler, &user, &latency, &http_ret);
+                      scheduler, &user, &latency, &http_ret, &rdma_bytes);
 
       if (cct->_conf->subsys.should_gather(ceph_subsys_rgw_access, 1)) {
         // access log line elements begin per Apache Combined Log Format with additions following
@@ -360,7 +361,7 @@ void handle_connection(boost::asio::io_context& context,
             << remote_endpoint.address() << " - " << user << " [" << log_apache_time{started} << "] \""
             << message.method_string() << ' ' << message.target() << ' '
             << http_version{message.version()} << "\" " << http_ret << ' '
-            << client.get_bytes_sent() + client.get_bytes_received() << ' '
+            << client.get_bytes_sent() + client.get_bytes_received() + rdma_bytes << ' '
             << log_header{message, http::field::referer, "\""} << ' '
             << log_header{message, http::field::user_agent, "\""} << ' '
             << log_header{message, http::field::range} << " latency="
@@ -540,6 +541,9 @@ tcp::endpoint parse_endpoint(boost::asio::string_view input,
       } else {
         auto port_str = input.substr(addr_end + 2);
         endpoint.port(parse_port(port_str.data(), ec));
+        if (ec) {
+          return endpoint;
+        }
       }
     } else {
       endpoint.port(default_port);
