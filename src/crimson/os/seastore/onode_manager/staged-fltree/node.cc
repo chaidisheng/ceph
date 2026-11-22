@@ -436,8 +436,8 @@ eagain_ifuture<Ref<Node>> Node::load_root(context_t c, RootNodeTracker& root_tra
   return c.nm.get_super(c.t, root_tracker
   ).handle_error_interruptible(
     eagain_iertr::pass_further{},
-    crimson::ct_error::input_output_error::assert_failure(fmt::format(
-        "{} EIO during get_super()", FNAME).c_str())
+    crimson::ct_error::input_output_error::assert_failure(
+        "{} EIO during get_super()", FNAME)
   ).si_then([c, &root_tracker, FNAME](auto&& _super) {
     assert(_super);
     auto root_addr = _super->get_root_laddr();
@@ -577,7 +577,7 @@ Node::try_merge_adjacent(
     Ref<Node> left_for_merge;
     Ref<Node> right_for_merge;
     Ref<Node>* p_this_ref;
-    bool is_left;
+    bool is_left = false; // read only when left_for_merge is set below
     if (!lnode && !rnode) {
       // XXX: this is possible before node rebalance is implemented,
       // when its parent cannot merge with its peers and has only one child
@@ -2159,8 +2159,8 @@ eagain_ifuture<Ref<LeafNode>> LeafNode::allocate_root(
     return c.nm.get_super(c.t, root_tracker
     ).handle_error_interruptible(
       eagain_iertr::pass_further{},
-      crimson::ct_error::input_output_error::assert_failure(fmt::format(
-        "{} EIO during get_super()", FNAME).c_str())
+      crimson::ct_error::input_output_error::assert_failure(
+        "{} EIO during get_super()", FNAME)
     ).si_then([c, root](auto&& super) {
       assert(super);
       root->make_root_new(c, std::move(super));

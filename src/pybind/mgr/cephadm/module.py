@@ -2395,6 +2395,7 @@ Then run the following:
         if spec.hostname not in self.inventory:
             self.cache.prime_empty_host(spec.hostname)
         self.inventory.add_host(spec)
+        self.cache.registry_login_queue.add(spec.hostname)
         self.offline_hosts_remove(spec.hostname)
         if spec.status == 'maintenance':
             self.update_maintenance_healthcheck()
@@ -3440,7 +3441,7 @@ Then run the following:
         self._daemon_action_set_image(action, image, d.daemon_type, d.daemon_id)
 
         self.log.info(f'Schedule {action} daemon {daemon_name}')
-        msg = self._schedule_daemon_action(daemon_name, action)
+        msg = self._schedule_daemon_action(daemon_name, action, force=force)
         note = self._unmanaged_noop_note(d.service_name())
         if note:
             msg += f'\n{note}'
@@ -3457,7 +3458,7 @@ Then run the following:
             self.cache.get_daemons_by_type('mgr')).container_image_digests
         return digests if digests else []
 
-    def _schedule_daemon_action(self, daemon_name: str, action: str) -> str:
+    def _schedule_daemon_action(self, daemon_name: str, action: str, force: bool = False) -> str:
         dd = self.cache.get_daemon(daemon_name)
         assert dd.daemon_type is not None
         assert dd.daemon_id is not None
@@ -3466,7 +3467,7 @@ Then run the following:
                 and not self.mgr_service.mgr_map_has_standby():
             raise OrchestratorError(
                 f'Unable to schedule redeploy for {daemon_name}: No standby MGRs')
-        self.cache.schedule_daemon_action(dd.hostname, dd.name(), action)
+        self.cache.schedule_daemon_action(dd.hostname, dd.name(), action, force=force)
         self.cache.save_host(dd.hostname)
         msg = "Scheduled to {} {} on host '{}'".format(action, daemon_name, dd.hostname)
         self._kick_serve_loop()
@@ -4479,7 +4480,12 @@ Then run the following:
         service_name: Optional[str] = None,
         hostname: Optional[str] = None,
     ) -> str:
-        self.cert_mgr.save_key(key_name, key, service_name, hostname, True)
+        # The key belongs to the pair of its certificate: do not let it override
+        # a pair that is not editable (inline in the spec or cephadm-generated).
+        cert_name = key_name.replace('_key', '_cert')
+        if not self.cert_mgr.is_cert_editable(cert_name, service_name or '', hostname or ''):
+            self._raise_non_editable_cert_error(cert_name, key_name, service_name or '', hostname or '')
+        self.cert_mgr.save_key(key_name, key, service_name, hostname, user_made=True, editable=True)
         return f'Key for {key_name} set correctly'
 
     @handle_orch_error
@@ -4770,12 +4776,20 @@ Then run the following:
                         f"\nunder the certificate '{svc.cert_name}' within the certmgr store. To set the certificate, use:\n"
                         f"\n  > ceph orch certmgr cert-key set --consumer {spec.service_type} --service-name {spec.service_name()} -i <cert-key-pem-file> \n"
                     )
+            elif svc.SCOPE == TLSObjectScope.GLOBAL:
+                cert_warning += (
+                    f"\n\n\nWarning: SSL is configured with '{CertificateSource.REFERENCE.value}', and this service uses a global certificate.\n\n"
+                    f"To configure the certificate/key, run:\n"
+                    f"  > ceph orch certmgr cert-key set --consumer {spec.service_type} -i <cert-key-pem-file>\n\n"
+                    f"Then run:\n"
+                    f"  > ceph orch reconfig {spec.service_name()}\n"
+                    f"to reconfigure the service with the certificate."
+                )
             else:
                 cert_warning += (
                     f"\n\n\nWarning: SSL is configured with '{CertificateSource.REFERENCE.value}', and this service uses per-host certificates.\n\n"
-                    f"To configure keys/certificates, run the following commands for each host daemons are deployed on:\n"
-                    f"  > ceph orch certmgr cert set --cert-name {svc.cert_name} --service-name {spec.service_name()} --hostname <host>  -i <cert-file>\n"
-                    f"  > ceph orch certmgr key set --key-name {svc.cert_name} --service-name {spec.service_name()} --hostname <host> -i <key-file>\n\n"
+                    f"To configure keys/certificates, run the following command for each host daemons are deployed on:\n"
+                    f"  > ceph orch certmgr cert-key set --consumer {spec.service_type} --service-name {spec.service_name()} --hostname <host> -i <cert-key-pem-file>\n\n"
                     f"Once all certificates are provisioned, run:\n"
                     f"  > ceph orch reconfig {spec.service_name()}\n"
                     f"to reconfigure the service with the certificates."
@@ -5237,9 +5251,9 @@ Then run the following:
             # `--daemon_types "mon, crash"` is treated the same as `--daemon_types "mon,crash"`.
             daemon_types = [dtype.strip() for dtype in daemon_types]
             for dtype in daemon_types:
-                if dtype not in utils.CEPH_IMAGE_TYPES:
+                if dtype not in utils.SUPPORTED_UPGRADE_DAEMON_TYPE_FILTER_TYPES:
                     raise OrchestratorError(f'Upgrade aborted - Got unexpected daemon type "{dtype}".\n'
-                                            f'Viable daemon types for this command are: {utils.CEPH_IMAGE_TYPES}')
+                                            f'Viable daemon types for this command are: {utils.SUPPORTED_UPGRADE_DAEMON_TYPE_FILTER_TYPES}')
         if services is not None:
             for service in services:
                 if service not in self.spec_store:

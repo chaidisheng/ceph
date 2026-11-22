@@ -22,6 +22,7 @@
 #include "common/Clock.h" // for ceph_clock_now()
 #include "common/debug.h"
 #include "common/Formatter.h"
+#include "common/strtol.h"
 #include "messages/MMgrReport.h"
 
 #define dout_context g_ceph_context
@@ -62,7 +63,11 @@ void DeviceState::set_metadata(map<string,string>&& m)
   }
   p = metadata.find("wear_level");
   if (p != metadata.end()) {
-    wear_level = atof(p->second.c_str());
+    std::string err;
+    float wear = strict_strtof(p->second, &err);
+    if (err.empty()) {
+      wear_level = wear;
+    }
   }
 }
 
@@ -115,10 +120,12 @@ string DeviceState::get_life_expectancy_str(utime_t now) const
     return "now";
   }
   utime_t min = life_expectancy.first - now;
-  utime_t max = life_expectancy.second - now;
-  if (life_expectancy.second == utime_t()) {
+  // utime_t is unsigned: don't compute max when it would underflow
+  if (life_expectancy.second == utime_t() ||
+      life_expectancy.second <= life_expectancy.first) {
     return string(">") + timespan_str(make_timespan(min));
   }
+  utime_t max = life_expectancy.second - now;
   string a = timespan_str(make_timespan(min));
   string b = timespan_str(make_timespan(max));
   if (a == b) {
@@ -235,7 +242,12 @@ void DaemonStateIndex::_insert(DaemonStatePtr dm)
     _erase(dm->key);
   }
 
-  by_server[dm->hostname][dm->key] = dm;
+  // Daemons register before metadata arrives, so hostname may still be
+  // empty; skip by_server to avoid a phantom "" bucket visible in
+  // get_by_server() and with_daemons_by_server().
+  if (!dm->hostname.empty()) {
+    by_server[dm->hostname][dm->key] = dm;
+  }
   all[dm->key] = dm;
 
   for (auto& i : dm->devices) {
@@ -274,10 +286,15 @@ void DaemonStateIndex::_erase(const DaemonKey& dmk)
     }
   }
 
-  auto &server_collection = by_server[dm->hostname];
-  server_collection.erase(dm->key);
-  if (server_collection.empty()) {
-    by_server.erase(dm->hostname);
+  // Mirror _insert: a daemon with an empty hostname was never indexed in
+  // by_server, so don't touch it here (operator[] would create the empty
+  // bucket we are trying to keep out of the index).
+  if (!dm->hostname.empty()) {
+    auto &server_collection = by_server[dm->hostname];
+    server_collection.erase(dm->key);
+    if (server_collection.empty()) {
+      by_server.erase(dm->hostname);
+    }
   }
 
   all.erase(to_erase);

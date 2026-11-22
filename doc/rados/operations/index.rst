@@ -21,6 +21,7 @@ cluster.
 	monitoring-osd-pg
 	user-management
         pgcalc/index
+        fdcalc/index
 
 .. raw:: html
 
@@ -49,6 +50,7 @@ CRUSH algorithm.
 	crush-map
 	crush-map-edits
 	stretch-mode
+        individual-stretch-pools
 	change-mon-elections
 
 

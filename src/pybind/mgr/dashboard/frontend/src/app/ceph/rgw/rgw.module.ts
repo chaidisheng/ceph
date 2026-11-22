@@ -13,9 +13,6 @@ import { PipesModule } from '~/app/shared/pipes/pipes.module';
 
 import { ActionLabels, URLVerbs } from '~/app/shared/constants/app.constants';
 
-import { FeatureTogglesGuardService } from '~/app/shared/services/feature-toggles-guard.service';
-import { ModuleStatusGuardService } from '~/app/shared/services/module-status-guard.service';
-
 import { ContextComponent } from '~/app/core/context/context.component';
 import { SharedModule } from '~/app/shared/shared.module';
 import { PerformanceCounterModule } from '../performance-counter/performance-counter.module';
@@ -57,8 +54,8 @@ import { RgwSyncPrimaryZoneComponent } from './rgw-sync-primary-zone/rgw-sync-pr
 import { RgwSyncMetadataInfoComponent } from './rgw-sync-metadata-info/rgw-sync-metadata-info.component';
 import { RgwSyncDataInfoComponent } from './rgw-sync-data-info/rgw-sync-data-info.component';
 import { BucketTagModalComponent } from './bucket-tag-modal/bucket-tag-modal.component';
-import { NfsFormComponent } from '../nfs/nfs-form/nfs-form.component';
-import { NFS_PAGE_HEADER } from '../nfs/nfs.constants';
+import { NfsModule } from '../nfs/nfs.module';
+import { nfsParentRoute } from '../nfs/nfs.routes';
 import { RgwMultisiteSyncPolicyComponent } from './rgw-multisite-sync-policy/rgw-multisite-sync-policy.component';
 import { RgwMultisiteSyncPolicyFormComponent } from './rgw-multisite-sync-policy-form/rgw-multisite-sync-policy-form.component';
 import { RgwConfigurationPageComponent } from './rgw-configuration-page/rgw-configuration-page.component';
@@ -112,6 +109,7 @@ import ChevronUpIcon from '@carbon/icons/es/chevron--up/16';
 import ProgressBarRoundIcon from '@carbon/icons/es/progress-bar--round/32';
 import ToolsIcon from '@carbon/icons/es/tools/32';
 import UserAccessLocked from '@carbon/icons/es/user--access-locked/16';
+import UserAdmin from '@carbon/icons/es/user--admin/16';
 
 import { ProductiveCardComponent } from '~/app/shared/components/productive-card/productive-card.component';
 import { TimePickerComponent } from '~/app/shared/components/time-picker/time-picker.component';
@@ -131,7 +129,6 @@ import { RgwBucketTieringFormComponent } from './rgw-bucket-tiering-form/rgw-buc
 import { RgwBucketLifecycleListComponent } from './rgw-bucket-lifecycle-list/rgw-bucket-lifecycle-list.component';
 import { RgwRateLimitComponent } from './rgw-rate-limit/rgw-rate-limit.component';
 import { RgwRateLimitDetailsComponent } from './rgw-rate-limit-details/rgw-rate-limit-details.component';
-import { NfsClusterComponent } from '../nfs/nfs-cluster/nfs-cluster.component';
 import { SmbModule } from '../smb/smb.module';
 import { smbParentRoute } from '../smb/smb.routes';
 import { RgwTopicListComponent } from './rgw-topic-list/rgw-topic-list.component';
@@ -195,7 +192,8 @@ import { RgwBucketTagsTableComponent } from './rgw-bucket-tags-table/rgw-bucket-
     ComponentsModule,
     ContentSwitcherModule,
     ContextComponent,
-    SmbModule
+    SmbModule,
+    NfsModule
   ],
   exports: [
     RgwDaemonResourcePageComponent,
@@ -289,7 +287,8 @@ export class RgwModule {
       ChevronUpIcon,
       ProgressBarRoundIcon,
       ToolsIcon,
-      UserAccessLocked
+      UserAccessLocked,
+      UserAdmin
     ]);
   }
 }
@@ -560,37 +559,7 @@ const routes: Routes = [
       }
     ]
   },
-  {
-    path: 'nfs',
-    canActivateChild: [FeatureTogglesGuardService, ModuleStatusGuardService],
-    data: {
-      moduleStatusGuardConfig: {
-        uiApiPath: 'nfs-ganesha',
-        redirectTo: 'error',
-        section: 'nfs-ganesha',
-        section_info: 'NFS GANESHA',
-        header: 'NFS-Ganesha is not configured'
-      },
-      breadcrumbs: $localize`Network Filesystem`
-    },
-    children: [
-      {
-        path: '',
-        component: NfsClusterComponent,
-        data: { pageHeader: NFS_PAGE_HEADER }
-      },
-      {
-        path: URLVerbs.CREATE,
-        component: NfsFormComponent,
-        data: { breadcrumbs: ActionLabels.CREATE }
-      },
-      {
-        path: `${URLVerbs.EDIT}/:cluster_id/:export_id`,
-        component: NfsFormComponent,
-        data: { breadcrumbs: ActionLabels.EDIT }
-      }
-    ]
-  },
+  nfsParentRoute(true, 'NFS'),
   smbParentRoute(true, 'SMB'),
   {
     path: 'configuration',

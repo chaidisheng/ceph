@@ -241,7 +241,7 @@ public:
     return false;
   }
 
-  bool is_local_store_full() const {
+  seastar::future<bool> is_local_store_full() const {
     return shard_services.is_local_storage_full(get_store_index());
   }
 
@@ -298,6 +298,10 @@ public:
 
   const pg_info_t& get_info() const final {
     return peering_state.get_info();
+  }
+
+  const auto& get_pgpool() const {
+    return peering_state.get_pgpool();
   }
 
   // DoutPrefixProvider
@@ -522,6 +526,15 @@ public:
     SUBDEBUGDPP(osd, "", *this);
     shard_services.remove_want_pg_temp(orderer, pgid.pgid);
   }
+  void send_pg_migrated_pool() final {
+    LOG_PREFIX(PG::send_pg_migrated_pool);
+    SUBDEBUGDPP(osd, "", *this);
+    std::optional<int64_t> migration_target = get_pgpool().info.migration_target;
+    ceph_assert(migration_target.has_value());
+    shard_services.send_pg_migrated_pool(orderer,
+                                         *migration_target,
+                                         pgid.pgid);
+  }
   void check_recovery_sources(const OSDMapRef& newmap) final {
     LOG_PREFIX(PG::check_recovery_sources);
     recovery_backend->for_each_recovery_waiter(
@@ -558,12 +571,13 @@ public:
   void on_change(ceph::os::Transaction &t) final;
   void on_activate(interval_set<snapid_t> to_trim) final;
   void on_replica_activate() final;
-  void on_activate_complete() final;
+  void on_activate_complete(HBHandle *handle) final;
   void on_new_interval() final {
     recovery_finisher = nullptr;
   }
   Context *on_clean() final;
-  void on_activate_committed() final {
+
+  void on_activate_committed(HBHandle *handle) final {
     // As in on_activate_complete(): ActivateCommitted may have left
     // the PG in PG_STATE_PEERED (acting_set_writeable() returned
     // false) rather than PG_STATE_ACTIVE.  Only unblock when we
@@ -675,6 +689,27 @@ public:
     recovery_handler->backfill_suspended();
   }
 
+  void on_pool_migration_source_reserved() final {
+    recovery_handler->on_pool_migration_source_reserved();
+  }
+  void on_pool_migration_source_suspended() final {
+    recovery_handler->on_pool_migration_source_suspended();
+  }
+  void on_pool_migration_target_reserved(HBHandle *handle) final {
+    recovery_handler->on_pool_migration_target_reserved();
+  }
+  void on_pool_migration_target_suspended(bool toofull) final {
+    recovery_handler->on_pool_migration_target_suspended(toofull);
+  }
+  void pool_migration_request_target_reservation() final {
+    // TODO Jamie - Crimson stub - not implemented yet
+    ceph_abort("pool_migration_request_target_reservation not implemented in crimson");
+  }
+  void pool_migration_release_target_reservation() final {
+    // TODO - Crimson stub - not implemented yet
+    ceph_abort("pool_migration_release_target_reservation not implemented in crimson");
+  }
+
   void on_recovery_cancelled() final {
     cancel_pglog_based_recovery_op();
   }
@@ -685,7 +720,7 @@ public:
 
 
   bool try_reserve_recovery_space(
-    int64_t primary_num_bytes, int64_t local_num_bytes) final {
+    int64_t primary_num_bytes, int64_t local_num_bytes, int64_t num_objects) final {
     // TODO
     return true;
   }
@@ -754,6 +789,10 @@ public:
     // not needed yet: replace with not a stub (needs to be wired up to monc)
     return OstreamTemp(CLOG_DEBUG, nullptr);
   }
+  OstreamTemp get_clog_warn() {
+    // not needed yet: replace with not a stub (needs to be wired up to monc)
+    return OstreamTemp(CLOG_WARN, nullptr);
+  }
   OstreamTemp get_clog_error() final {
     // not needed yet: replace with not a stub (needs to be wired up to monc)
     return OstreamTemp(CLOG_ERROR, nullptr);
@@ -765,6 +804,18 @@ public:
 
 
   // Utility
+  bool state_test(uint64_t m) const {
+    return peering_state.state_test(m);
+  }
+  void state_clear(uint64_t m) {
+    peering_state.state_clear(m);
+  }
+  void state_set(uint64_t m) {
+    peering_state.state_set(m);
+  }
+  bool is_clean() const {
+    return peering_state.is_clean();
+  }
   bool is_active() const {
     return peering_state.is_active();
   }
@@ -800,9 +851,6 @@ public:
     return get_info().history.same_interval_since;
   }
 
-  const auto& get_pgpool() const {
-    return peering_state.get_pgpool();
-  }
   pg_shard_t get_primary() const {
     return peering_state.get_primary();
   }
@@ -835,6 +883,7 @@ public:
     peering_state.update_peer_last_complete_ondisk(fromosd, lcod);
   }
 
+  unsigned get_scrub_priority();
   /// initialize created PG
   seastar::future<> init(
     int role,
@@ -1004,6 +1053,7 @@ private:
   interruptible_future<MURef<MOSDOpReply>> do_pg_ops(Ref<MOSDOp> m);
 
 public:
+  int do_scrub_ls(const MOSDOp *m, OSDOp *osd_op) const;
   using rep_op_fut_t = std::tuple<interruptible_future<>,
                                   interruptible_future<>>;
   interruptible_future<rep_op_fut_t>
@@ -1073,16 +1123,22 @@ public:
     const osd_reqid_t& reqid);
 
   // scrub state
-
   friend class ScrubScan;
   friend class ScrubFindRange;
   friend class ScrubReserveRange;
+  friend class ScrubSleep;
+  friend class ScrubDigestUpdate;
+  friend class ScrubSnapMapperRepair;
   friend class scrub::PGScrubber;
   template <typename T> friend class RemoteScrubEventBaseT;
 
   scrub::PGScrubber scrubber;
 
+  seastar::future<scrub::schedule_result_t> start_scrubbing(
+    const scrub::SchedEntry& candidate,
+    scrub::OSDRestrictions osd_restrictions);
   void scrub_requested(scrub_level_t scrub_level, scrub_type_t scrub_type) final;
+  void on_scrub_schedule_input_change();
 
   ObjectContextRegistry obc_registry;
   ObjectContextLoader obc_loader;
@@ -1094,7 +1150,9 @@ public:
   // PeeringListener
   void publish_stats_to_osd() final;
   void clear_publish_stats() final;
-  pg_stat_t get_stats() const;
+  /// the stats last published by this PG, or nullopt if there are none
+  /// (e.g. at the start of a new interval, before peering publishes them)
+  std::optional<pg_stat_t> get_stats() const;
   void apply_stats(
     const hobject_t &soid,
     const object_stat_sum_t &delta_stats) final;
@@ -1131,6 +1189,9 @@ public:
   }
   PGRecovery* get_recovery_handler() final {
     return recovery_handler.get();
+  }
+  scrub::PGScrubber* get_scrubber() final {
+    return &scrubber;
   }
   PeeringState& get_peering_state() final {
     return peering_state;
@@ -1325,10 +1386,13 @@ private:
   const std::set<pg_shard_t> &get_actingset() const {
     return peering_state.get_actingset();
   }
-  void add_local_next_event(const pg_log_entry_t& e) override final {
+  void add_local_next_event(const pg_log_entry_t& e) override {
     peering_state.add_local_next_event(e);
   }
-  void op_applied(const eversion_t &applied_version) override final;
+  void op_applied(const eversion_t &applied_version) override;
+  void on_sub_write_applied(const eversion_t &at_version) override {
+    scrubber.on_log_update(at_version);
+  }
 
 private:
   friend class IOInterruptCondition;
@@ -1341,6 +1405,9 @@ private:
   std::map<ceph_tid_t, log_update_t> log_entry_update_waiting_on;
   // snap trimming
   interval_set<snapid_t> snap_trimq;
+
+  std::optional<hobject_t> consider_updating_migration_watermark(
+    std::set<hobject_t> &deleted) override;
 };
 
 struct PG::do_osd_ops_params_t {

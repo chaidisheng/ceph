@@ -1652,7 +1652,7 @@ void bluestore::ExtentMap::make_range_shared_maybe_merge(
       dirty_range_begin = std::min<uint32_t>(dirty_range_begin, e.blob_start());
       // first try to find a shared blob nearby
       // that can accomodate extra extents
-      uint32_t blob_width; // to signal when extents end
+      uint32_t blob_width = 0; // to signal when extents end
       dout(20) << __func__ << std::hex << " e.blob_start=" << e.blob_start()
                << " e.logical_offset=" << e.logical_offset << std::dec << dendl;
       Blob *b = blob.is_compressed() ? nullptr :
@@ -2843,7 +2843,7 @@ std::pair<uint32_t, uint32_t> bluestore::ExtentMap::fault_range_ex(
     return {0, BlueStore::OBJECT_MAX_SIZE};
   }
   auto start = seek_shard(offset);
-  auto last = seek_shard(offset + length);
+  auto last = seek_shard(range_end(offset, length));
   maybe_load_shard(db, start, last);
   uint32_t left_bound = shards[start].shard_info->offset;
   uint32_t right_bound =  (size_t)last + 1 < shards.size() ?
@@ -2866,7 +2866,7 @@ void bluestore::ExtentMap::fault_range(
     return;
   }
   auto start = seek_shard(offset);
-  auto last = seek_shard(offset + length);
+  auto last = seek_shard(range_end(offset, length));
   maybe_load_shard(db, start, last);
 }
 

@@ -1,5 +1,7 @@
 #include "IoSequence.h"
 #include <algorithm>
+#include <set>
+#include <array>
 
 #include <iostream>
 
@@ -62,6 +64,15 @@ std::ostream& ceph::io_exerciser::operator<<(std::ostream& os,
     case Sequence::SEQUENCE_SEQ16:
       os << "SEQUENCE_SEQ16";
       break;
+    case Sequence::SEQUENCE_SEQ17:
+      os << "SEQUENCE_SEQ17";
+      break;
+    case Sequence::SEQUENCE_SEQ18:
+      os << "SEQUENCE_SEQ18";
+      break;
+    case Sequence::SEQUENCE_SEQ19:
+      os << "SEQUENCE_SEQ19";
+      break;
     case Sequence::SEQUENCE_END:
       os << "SEQUENCE_END";
       break;
@@ -70,7 +81,8 @@ std::ostream& ceph::io_exerciser::operator<<(std::ostream& os,
 }
 
 bool IoSequence::is_supported(Sequence sequence) const {
-  return sequence != Sequence::SEQUENCE_SEQ10;
+  return sequence != Sequence::SEQUENCE_SEQ10 &&
+         sequence != Sequence::SEQUENCE_SEQ19;
 }
 
 std::unique_ptr<IoSequence> IoSequence::generate_sequence(
@@ -113,6 +125,15 @@ std::unique_ptr<IoSequence> IoSequence::generate_sequence(
       return std::make_unique<Seq15>(obj_size_range, seed, check_consistency);
     case Sequence::SEQUENCE_SEQ16:
       return std::make_unique<Seq16>(obj_size_range, seed, check_consistency);
+    case Sequence::SEQUENCE_SEQ17:
+      return std::make_unique<Seq17>(obj_size_range, seed, check_consistency);
+    case Sequence::SEQUENCE_SEQ18:
+      return std::make_unique<Seq18>(obj_size_range, seed, check_consistency);
+    case Sequence::SEQUENCE_SEQ19:
+      ceph_abort_msg(
+          "Sequence 18 only supported for erasure coded pools "
+          "through the EcIoSequence interface");
+      return nullptr;
     default:
       break;
   }
@@ -940,4 +961,167 @@ std::unique_ptr<ceph::io_exerciser::IoOp> ceph::io_exerciser::Seq16::_next() {
   // Should not reach here
   barrier = true;
   return BarrierOp::generate();
+}
+
+// Seq17: TruncateWrite ops that truncate an object of size X to T and then
+// write blocks O to E - 1. T takes every value up to X + 3. O and E take the
+// values at and either side of T and X, O also takes 0 and 1, and E also
+// takes O + 1 and max(X, T) + 2. Each op is applied to a new object of size
+// X and followed by a read of the whole object.
+ceph::io_exerciser::Seq17::Seq17(std::pair<int, int> obj_size_range, int seed,
+                                 bool check_consistency)
+    : IoSequence(obj_size_range, seed, check_consistency) {
+  select_random_object_size();
+  setup_writes();
+}
+
+Sequence ceph::io_exerciser::Seq17::get_id() const {
+  return Sequence::SEQUENCE_SEQ17;
+}
+
+std::string ceph::io_exerciser::Seq17::get_name() const {
+  return "Permutations of truncate size, write offset and write length in "
+         "a TruncateWrite op on an object of size " +
+         std::to_string(obj_size);
+}
+
+void ceph::io_exerciser::Seq17::setup_writes() {
+  std::set<uint64_t> boundaries{truncate_size, truncate_size + 1, obj_size,
+                                obj_size + 1};
+  if (truncate_size > 0) {
+    boundaries.insert(truncate_size - 1);
+  }
+  if (obj_size > 0) {
+    boundaries.insert(obj_size - 1);
+  }
+  std::set<uint64_t> offsets = boundaries;
+  offsets.insert({0, 1});
+  std::set<uint64_t> ends = boundaries;
+  ends.insert(std::max(obj_size, truncate_size) + 2);
+
+  writes.clear();
+  for (uint64_t offset : offsets) {
+    writes.emplace_back(offset, offset + 1);
+    for (uint64_t end : ends) {
+      if (end > offset + 1) {
+        writes.emplace_back(offset, end);
+      }
+    }
+  }
+  write_index = 0;
+}
+
+std::unique_ptr<ceph::io_exerciser::IoOp> ceph::io_exerciser::Seq17::_next() {
+  const auto [offset, end] = writes[write_index];
+  if (!donewrite) {
+    donewrite = true;
+    barrier = true;
+    return SingleTruncateWriteOp::generate(truncate_size, offset, end - offset);
+  }
+  if (!doneread) {
+    doneread = true;
+    return SingleReadOp::generate(0, std::max(truncate_size, end));
+  }
+  donewrite = false;
+  doneread = false;
+  if (++write_index == writes.size()) {
+    if (++truncate_size > obj_size + 3) {
+      done = true;
+    } else {
+      setup_writes();
+    }
+  }
+  create = true;
+  barrier = true;
+  remove = true;
+  return BarrierOp::generate();
+}
+
+// Generates the combinations of write and truncate parameters used by Seq17
+// and Seq18. The points are chosen around the interesting boundaries: the
+// start of the object, the smallest truncate size (10), the object size (24)
+// and the largest truncate size (30).
+std::vector<ceph::io_exerciser::WriteTruncateCase>
+ceph::io_exerciser::generate_write_truncate_cases(uint64_t max_write_end) {
+  static constexpr std::array<uint64_t, 10> write_points = {0,  1,  9,  10, 11,
+                                                            23, 24, 25, 29, 30};
+  // Single truncate: shrink, no-op and grow, either side of each boundary
+  static constexpr std::array<uint64_t, 8> single_sizes = {10, 11, 17, 23,
+                                                           24, 25, 29, 30};
+  // Pairs of truncates: every ordering of shrink, no-op and grow
+  static constexpr std::array<uint64_t, 4> double_sizes = {10, 17, 24, 30};
+
+  std::vector<WriteTruncateCase> cases;
+  for (uint64_t offset : write_points) {
+    for (uint64_t end : write_points) {
+      if (end <= offset || end > max_write_end) {
+        continue;
+      }
+      const uint64_t length = end - offset;
+      for (uint64_t size : single_sizes) {
+        cases.push_back({offset, length, size, std::nullopt});
+      }
+      for (uint64_t size1 : double_sizes) {
+        for (uint64_t size2 : double_sizes) {
+          cases.push_back({offset, length, size1, size2});
+        }
+      }
+    }
+  }
+  return cases;
+}
+
+// Seq18: WriteTruncate and WriteTruncate2 operations on objects created with
+// a fixed size of WRITE_TRUNCATE_OBJECT_SIZE blocks. Each case:
+//   1. Creates the object
+//   2. Writes then truncates (once or twice) in a single operation
+//   3. Reads the whole object and, if requested, checks consistency
+//   4. Removes the object
+// The object size range requested by the user is ignored.
+ceph::io_exerciser::Seq18::Seq18(std::pair<int, int> obj_size_range, int seed,
+                                 bool check_consistency)
+    : IoSequence(std::make_pair(static_cast<int>(WRITE_TRUNCATE_OBJECT_SIZE),
+                                static_cast<int>(WRITE_TRUNCATE_OBJECT_SIZE)),
+                 seed, check_consistency),
+      cases(generate_write_truncate_cases(WRITE_TRUNCATE_MAX_SIZE)),
+      case_idx(0),
+      stage(Stage::WRITE_TRUNCATE) {}
+
+Sequence ceph::io_exerciser::Seq18::get_id() const {
+  return Sequence::SEQUENCE_SEQ18;
+}
+
+std::string ceph::io_exerciser::Seq18::get_name() const {
+  return "WriteTruncate and WriteTruncate2 operations with edge case write "
+         "locations and truncate sizes on objects of fixed size";
+}
+
+std::unique_ptr<ceph::io_exerciser::IoOp> ceph::io_exerciser::Seq18::_next() {
+  const WriteTruncateCase& c = cases[case_idx];
+  switch (stage) {
+    case Stage::WRITE_TRUNCATE:
+      stage = Stage::READ;
+      barrier = true;
+      if (c.size2) {
+        return DoubleWriteTruncateOp::generate(c.offset, c.length, c.size1,
+                                               *c.size2);
+      }
+      return SingleWriteTruncateOp::generate(c.offset, c.length, c.size1);
+    case Stage::READ:
+      stage = Stage::RESET;
+      barrier = true;
+      consistency = check_consistency;
+      return SingleReadOp::generate(0, c.final_size());
+    case Stage::RESET:
+    default:
+      stage = Stage::WRITE_TRUNCATE;
+      case_idx++;
+      remove = true;
+      if (case_idx >= cases.size()) {
+        done = true;
+      } else {
+        create = true;
+      }
+      return BarrierOp::generate();
+  }
 }

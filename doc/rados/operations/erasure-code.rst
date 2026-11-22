@@ -62,11 +62,17 @@ profile can be displayed with this command:
    
 ::
 
+   crush-device-class=
+   crush-failure-domain=host
+   crush-root=default
+   crush-zone-failure-domain=datacenter
    k=2
    m=2
    plugin=isa
-   crush-failure-domain=host
    technique=reed_sol_van
+
+The ``crush-*`` keys are where erasure-coded pools that name no profile are
+placed (see :ref:`pool-creation-defaults`).
 
 .. note::
   The profile just displayed is for the *default* erasure-coded pool, not the
@@ -252,6 +258,9 @@ unsupported combination of plugin and technique, such as CLAY, LRC, or
 SHEC, is blocked with an error message.
 
 The default stripe unit is 4K which works well for standard EC pools.
+A pool over two zones (``num_zones`` 2) is always optimized. Its stripe unit
+is 16K unless :confval:`osd_pool_erasure_code_stripe_unit` is set or its
+profile sets ``stripe_unit``.
 The stripe unit must be a multiple of 4 KiB for optimizations to be
 enabled; enabling the flag on a pool with any other stripe unit is
 rejected.
@@ -291,7 +300,7 @@ and when performing cluster recovery or backfill.
 Below is a table showing the overhead factors for various values of ``k`` and ``m``.
 As ``k`` increases above ``4``, the incremental space amplification gain
 experiences diminishing returns but the performance impact grows proportionally.
-We recommend that you do not choose a profile with ``k`` > ``4` or ``m`` > 2 unless
+We recommend that you do not choose a profile with ``k`` > ``4`` or ``m`` > ``2`` unless
 and until you fully understand the ramifications, including the number of
 failure domains your cluster topology presents.  If  you choose ``m=1``,
 expect data unavailability during maintenance and data loss when component

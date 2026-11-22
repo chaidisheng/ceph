@@ -11,6 +11,9 @@ NFS_CORE_PARAM {
         Enable_UDP = false;
         NFS_Port = {{ port }};
         allow_set_io_flusher_fail = true;
+{% if ceph_nodes %}
+        Cluster_Members = {{ ceph_nodes|join(", ") }};
+{% endif %}
 {% if haproxy_hosts %}
         HAProxy_Hosts = {{ haproxy_hosts|join(", ") }};
 {% endif %}
@@ -53,10 +56,6 @@ RADOS_KV {
         namespace = "{{ namespace }}";
 }
 
-CEPH_NODES_LIST {
-        Ceph_Nodes = {{ ceph_nodes|join(", ") }};
-}
-
 RADOS_URLS {
         UserId = "{{ user }}";
         watch_url = "{{ url }}";
@@ -67,8 +66,9 @@ RGW {
         name = "client.{{ rgw_user }}";
 }
 
-{% if use_old_nodeid or enable_client_object_cache or clients_per_pool %}
 CEPH {
+        register_service = true;
+        nodeid = "{{ ceph_nodeid }}";
 {% if use_old_nodeid %}
         Use_old_uuid = true;
 {% endif %}
@@ -86,7 +86,6 @@ CEPH {
 {% endif %}
 }
 
-{% endif %}
 {% if kmip_addrs %}
 %plugin ganesha/libkmip_fscrypt.so
 KMIP {

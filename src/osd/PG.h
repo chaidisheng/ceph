@@ -506,6 +506,8 @@ public:
   void queue_want_pg_temp(const std::vector<int> &wanted) override;
   void clear_want_pg_temp() override;
 
+  void send_pg_migrated_pool() override;
+
   void on_new_interval() override;
 
   void on_role_change() override;
@@ -611,8 +613,6 @@ public:
 
   void on_replica_activate() override;
 
-  void on_activate_committed() override;
-
   void on_active_actmap() override;
   void on_active_advmap(const OSDMapRef &osdmap) override;
 
@@ -622,6 +622,8 @@ public:
   void on_backfill_suspended() override;
   void on_recovery_cancelled() override {}
   void on_recovery_reserved() override;
+  void on_pool_migration_source_suspended() override;
+  void on_pool_migration_source_reserved() override;
 
   bool is_forced_recovery_or_backfill() const {
     return recovery_state.is_forced_recovery_or_backfill();
@@ -883,6 +885,8 @@ protected:
   std::map<pg_shard_t, ReplicaBackfillInterval> peer_backfill_info;
   bool backfill_reserving;
 
+  PoolMigrationInterval pool_migration_info;
+
   // The primary's num_bytes and local num_bytes for this pg, only valid
   // during backfill for non-primary shards.
   // Both of these are adjusted for EC to reflect the on-disk bytes
@@ -905,7 +909,9 @@ public:
     return primary_num_bytes.load() > 0;
   }
 
-  bool try_reserve_recovery_space(int64_t primary, int64_t local) override;
+  bool try_reserve_recovery_space(int64_t primary,
+				  int64_t local,
+				  int64_t num_objects) override;
   void unreserve_recovery_space() override;
 
   // If num_bytes are inconsistent and local_num- goes negative
@@ -1029,6 +1035,9 @@ protected:
    *  - waiting_for_readable
    *    - now > readable_until
    *    - unblocks when we get fresh(er) osd_pings
+   *  - waiting_for_coro_op
+   *    - coro_op_in_flight
+   *    - may start or stop blocking at any time
    *  - waiting_for_scrub
    *    - starts and stops blocking for varying intervals during scrub
    *  - waiting_for_unreadable_object
@@ -1058,6 +1067,28 @@ protected:
    * encounter an unexpected error.  FIXME.
    */
 
+  /**
+   * Waiting lists along the request processing pipeline, in pipeline order.
+   * Used by requeue_op/requeue_ops to decide whether a requeued op should
+   * be pushed to the front or back of a waiting list to maintain op ordering.
+   */
+  enum class OpWaitingList : uint8_t {
+    MAP, // First waiting list
+    PEERED,
+    FLUSH,
+    ACTIVE,
+    READABLE,
+    CORO,
+    SCRUB,
+    UNREADABLE_OBJECT,
+    DEGRADED_OBJECT,
+    BLOCKED_OBJECT,
+    CACHE_NOT_FULL,
+    OBJECT_LOCK,
+    PRIMARY_REPAIR, // Last waiting list
+    IN_PROGRESS, // Not on a waiting list. Op was being processed
+  };
+
   // ops with newer maps than our (or blocked behind them)
   // track these by client, since inter-request ordering doesn't otherwise
   // matter.
@@ -1068,6 +1099,10 @@ protected:
 
   /// ops waiting on readble
   std::list<OpRequestRef>            waiting_for_readable;
+
+  /// ops waiting for the in-flight EC coroutine op to complete
+  std::list<OpRequestRef>            waiting_for_coro_op;
+  bool coro_op_in_flight = false;
 
   // ops waiting on active (require peered as well)
   std::list<OpRequestRef>            waiting_for_active;
@@ -1093,9 +1128,14 @@ protected:
 	std::tuple<OpRequestRef, version_t, int,
 		   std::vector<pg_log_op_return_item_t>>>> waiting_for_ondisk;
 
-  void requeue_object_waiters(std::map<hobject_t, std::list<OpRequestRef>>& m);
-  void requeue_op(OpRequestRef op);
-  void requeue_ops(std::list<OpRequestRef> &l);
+  void requeue_object_waiters(
+    std::map<hobject_t, std::list<OpRequestRef>>& m,
+    OpWaitingList prev_queue);
+  void requeue_op(
+    OpRequestRef op, OpWaitingList prev_queue);
+  void requeue_ops(
+    std::list<OpRequestRef> &l,
+    OpWaitingList prev_queue);
 
   // stats that persist lazily
   object_stat_collection_t unstable_stats;
@@ -1113,6 +1153,9 @@ protected:
   }
   bool needs_backfill() const {
     return recovery_state.needs_backfill();
+  }
+  bool needs_pool_migration() const {
+    return recovery_state.needs_pool_migration();
   }
 
   bool all_unfound_are_queried_or_lost(const OSDMapRef osdmap) const;
@@ -1291,6 +1334,7 @@ protected:
   bool is_down() const { return recovery_state.is_down(); }
   bool is_recovery_unfound() const { return recovery_state.is_recovery_unfound(); }
   bool is_backfill_unfound() const { return recovery_state.is_backfill_unfound(); }
+  bool is_migration_unfound() const { return recovery_state.is_migration_unfound(); }
   bool is_incomplete() const { return recovery_state.is_incomplete(); }
   bool is_clean() const { return recovery_state.is_clean(); }
   bool is_undersized() const { return recovery_state.is_undersized(); }

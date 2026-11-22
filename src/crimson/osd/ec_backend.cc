@@ -106,6 +106,11 @@ struct ECCrimsonOp : ECCommon::RMWPipeline::Op {
   PGTransactionUPtr t;
   const PGLog &pg_log;
 
+  std::optional<hobject_t> consider_updating_migration_watermark(ECListener *parent) override {
+    // TODO: Implement migration watermark logic
+    return std::nullopt;  // For now, return empty (no migration)
+  }
+
   static PGTransactionUPtr translate_transaction(
     ceph::os::Transaction&& t,
     crimson::osd::ObjectContextRef &&obc,
@@ -429,8 +434,15 @@ ECBackend::handle_sub_write(
   }
   DEBUGDPP("line={}", dpp, __LINE__);
   return crimson::os::with_store_do_transaction(
-      store, coll, std::move(txn)).then([FNAME, tid=op.tid, &dpp=this->dpp] {
+      store, coll, std::move(txn)).then(
+      [FNAME, tid=op.tid, at_version=op.at_version, &dpp=this->dpp, &pg] {
     DEBUGDPP("tid={} transaction commited!", dpp, tid);
+    // Only now is the write (including backfill/async-recovery sub-writes)
+    // actually durable in the local object store; let a waiting scrub
+    // chunk scan on this shard proceed against it.
+    if (at_version != eversion_t()) {
+      pg.on_sub_write_applied(at_version);
+    }
     return write_iertr::now();
   });
 }

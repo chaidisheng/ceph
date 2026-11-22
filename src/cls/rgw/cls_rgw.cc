@@ -423,6 +423,11 @@ static int encode_list_index_key(cls_method_context_t hctx, const cls_rgw_obj_ke
   rgw_bucket_dir_entry entry;
 
   int ret = read_index_entry(hctx, obj_index_key, &entry);
+  if (ret == -ENOENT && tmp_key.instance.empty()) {
+    /* a null delete marker has its own instance key */
+    encode_obj_versioned_data_key(tmp_key, &obj_index_key, true);
+    ret = read_index_entry(hctx, obj_index_key, &entry);
+  }
   if (ret == -ENOENT) {
    /* couldn't find the entry, set key value after the current object */
     char buf[2] = { 0x1, 0 };
@@ -5375,7 +5380,7 @@ static int rgw_get_bucket_resharding(cls_method_context_t hctx,
 
 CLS_INIT(rgw)
 {
-  CLS_LOG(1, "Loaded rgw class!");
+  CLS_LOG(0, "Loaded rgw class!");
 
   cls_handle_t h_class;
   cls_method_handle_t h_rgw_bucket_init_index;

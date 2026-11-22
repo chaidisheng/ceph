@@ -51,6 +51,20 @@ def _add_cfg(cfg_dict: Dict[str, Any], key: str, value: Any) -> None:
         cfg_dict[key] = value
 
 
+def _redacted_config(config_blobs: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of config_blobs that is safe to log.
+
+    The keyring and file contents (TLS keys, external cluster keyrings) are
+    secrets. Keep this in sync if new secret values are added to the config.
+    """
+    out = dict(config_blobs)
+    if 'keyring' in out:
+        out['keyring'] = '<redacted>'
+    if 'files' in out:
+        out['files'] = sorted(out['files'])
+    return out
+
+
 @register_cephadm_service
 class SMBService(CephService):
     TYPE = 'smb'
@@ -307,7 +321,9 @@ class SMBService(CephService):
         if smb_spec.tunables:
             config_blobs['tunables'] = smb_spec.tunables
 
-        logger.debug('smb generate_config: %r', config_blobs)
+        logger.debug(
+            'smb generate_config: %r', _redacted_config(config_blobs)
+        )
         self._configure_cluster_meta(smb_spec, daemon_spec)
         deps = self.get_dependencies(self.mgr, smb_spec, daemon_spec.daemon_type)
         return config_blobs, deps
@@ -331,6 +347,29 @@ class SMBService(CephService):
     ) -> None:
         # TODO ???
         logger.warning('config_dashboard is a no-op')
+
+    def post_remove(self, daemon: DaemonDescription, is_failed_deploy: bool) -> None:
+        """
+        Called after a daemon is removed.
+        """
+        super().post_remove(daemon, is_failed_deploy=is_failed_deploy)
+
+        svc_name = daemon.service_name()
+        host = daemon.hostname
+        if self._other_daemons_in_service(daemon):
+            logger.debug(
+                "Not removing TLS cert/key for %s: daemons still present in service",
+                svc_name
+            )
+            return
+        for feature in SMB_FEATURE_SUPPORTS_SSL:
+            self.mgr.cert_mgr.rm_inline_saved_cert_key_pair(
+                f'smb_{feature}_ssl_cert',
+                f'smb_{feature}_ssl_key',
+                service_name=svc_name,
+                host=host,
+                ca_cert_name=f'smb_{feature}_ca_cert',
+            )
 
     def get_auth_entity(self, daemon_id: str, host: str = "", rados_user: str = '') -> AuthEntity:
         # We want a clear, distinct auth entity for fetching the config versus

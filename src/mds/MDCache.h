@@ -318,6 +318,11 @@ class MDCache {
     stray_manager.eval_remote(dn);
   }
 
+  void drop_stray_requests_to(mds_rank_t who)
+  {
+    stray_manager.drop_requests_to(who);
+  }
+
   void _send_discover(discover_info_t& dis);
   discover_info_t& _create_discover(mds_rank_t mds) {
     ceph_tid_t t = ++discover_last_tid;
@@ -712,6 +717,10 @@ private:
   void rejoin_start(MDSContext *rejoin_done_);
   void rejoin_gather_finish();
   void rejoin_send_rejoins();
+  void rejoin_send_rejoins_if_pending() {
+    if (rejoins_pending)
+      rejoin_send_rejoins();
+  }
   void rejoin_export_caps(inodeno_t ino, client_t client, const cap_reconnect_t& icr,
 			  int target=-1, bool drop_path=false) {
     auto& ex = cap_exports[ino];
@@ -1242,10 +1251,20 @@ private:
     librados::snap_set_t snaps;
   };
 
-  void file_blockdiff(CInode *in1, CInode *in2, BlockDiff *block_diff, uint64_t max_objects,
+  struct FileBlockDiffSnapshot;
+
+  void file_blockdiff(CInode *in1, snapid_t snapid1,
+                      CInode *in2, snapid_t snapid2,
+                      BlockDiff *block_diff, uint64_t max_objects,
+                      MDSContext *ctx);
+  void file_blockdiff(const FileBlockDiffSnapshot *in1,
+                      const FileBlockDiffSnapshot *in2,
+                      BlockDiff *block_diff, uint64_t max_objects,
                       MDSContext *ctx);
   void aggregate_snap_sets(const std::vector<std::unique_ptr<SnapSetContext>> &snap_set_ctx,
-                           CInode *in1, CInode *in2, BlockDiff *block_diff, Context *on_finish);
+                           const FileBlockDiffSnapshot *in1,
+                           const FileBlockDiffSnapshot *in2,
+                           BlockDiff *block_diff, Context *on_finish);
 
  protected:
   // track leader requests whose peers haven't acknowledged commit
@@ -1330,8 +1349,7 @@ private:
   void rejoin_send_acks();
   void rejoin_trim_undef_inodes();
   void maybe_send_pending_rejoins() {
-    if (rejoins_pending)
-      rejoin_send_rejoins();
+    rejoin_send_rejoins_if_pending();
   }
 
   void touch_inode(CInode *in) {
@@ -1434,6 +1452,7 @@ private:
   // [rejoin]
   bool rejoins_pending = false;
   std::set<mds_rank_t> rejoin_gather;      // nodes from whom i need a rejoin
+  std::set<mds_rank_t> rejoin_weak_applied; // survivor: OP_WEAK already applied
   std::set<mds_rank_t> rejoin_sent;        // nodes i sent a rejoin to
   std::set<mds_rank_t> rejoin_ack_sent;    // nodes i sent a rejoin to
   std::set<mds_rank_t> rejoin_ack_gather;  // nodes from whom i need a rejoin ack

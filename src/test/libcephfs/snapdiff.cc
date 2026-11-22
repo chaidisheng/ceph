@@ -38,7 +38,6 @@
 #include <dirent.h>
 #include <optional>
 #include <random>
-#include <sstream>
 #include <string.h>
 
 using namespace std;
@@ -71,6 +70,13 @@ public:
   }
   void set_diff_mask(unsigned mask) {
     diff_mask = mask;
+  }
+  void remount() {
+    ceph_shutdown(cmount);
+    ceph_create(&cmount, NULL);
+    ceph_conf_read_file(cmount, NULL);
+    ceph_conf_parse_env(cmount, NULL);
+    ceph_assert(0 == ceph_mount(cmount, NULL));
   }
   int conf_get(const char *option, char *buf, size_t len) {
     return ceph_conf_get(cmount, option, buf, len);
@@ -128,13 +134,18 @@ public:
 
   bool wait_for_subtree_on_rank(const char* relpath, const char* rank) {
     const auto path = make_file_path(relpath);
+    const auto rank_id = std::stoi(rank);
     for (unsigned attempt = 0; attempt < 30; ++attempt) {
       auto subtrees = tell_rank(rank, "get subtrees");
       if (!subtrees.is_null()) {
-        std::ostringstream oss;
-        json_spirit::write(subtrees, oss);
-        if (oss.str().find(path) != std::string::npos) {
-          return true;
+        for (const auto& subtree : subtrees.get_array()) {
+          const auto& entry = subtree.get_obj();
+          if (entry.at("dir").get_obj().at("path").get_str() == path &&
+              entry.at("is_auth").get_bool() &&
+              entry.at("auth_first").get_int() == rank_id &&
+              entry.at("auth_second").get_int() == -2) {
+            return true;
+          }
         }
       }
       sleep(1);
@@ -285,6 +296,19 @@ public:
     auto existing_path = make_file_path(existing);
     auto new_path = make_file_path(newname);
     return ceph_link(cmount, existing_path.c_str(), new_path.c_str());
+  }
+  int rename(const char* existing, const char* newname)
+  {
+    auto existing_path = make_file_path(existing);
+    auto new_path = make_file_path(newname);
+    return ceph_rename(cmount, existing_path.c_str(), new_path.c_str());
+  }
+  int create_file_with_layout(const char* relpath, uint64_t object_size)
+  {
+    auto path = make_file_path(relpath);
+    int fd = ceph_open_layout(cmount, path.c_str(), O_CREAT | O_EXCL | O_WRONLY,
+                              0666, object_size, 1, object_size, nullptr);
+    return fd < 0 ? fd : ceph_close(cmount, fd);
   }
   int setxattr(const char* relpath, const char* name, const char* value)
   {
@@ -473,8 +497,8 @@ public:
     const vector<pair<string, uint64_t>>& expected0)
   {
     vector<pair<string, uint64_t>> expected(expected0);
-    auto end = expected.end();
     auto check_fn = [&](const dirent* dire, uint64_t snapid) {
+      auto end = expected.end();
       pair<string, uint64_t> p = std::make_pair(dire->d_name, snapid);
       auto it = std::find(expected.begin(), end, p);
       if (it == end) {
@@ -505,8 +529,14 @@ public:
   int for_each_file_blockdiff(const char* relpath,
 			      const char* snap1,
 			      const char* snap2,
-			      interval_set<uint64_t> *expected=nullptr)
+			      interval_set<uint64_t> *expected=nullptr,
+                              interval_set<uint64_t> *actual=nullptr)
   {
+    // Preserve expected-set subtraction for existing callers; exact-result
+    // tests can collect the returned extents separately.
+    if (actual) {
+      actual->clear();
+    }
     auto s1 = make_snap_name(snap1);
     auto s2 = make_snap_name(snap2);
     ceph_file_blockdiff_info info;
@@ -527,6 +557,9 @@ public:
       r = ceph_file_blockdiff(&info, &blocks);
       if (r < 0) {
 	std::cerr << " Failed to get next changed block, ret:" << r << std::endl;
+	int finish_r = ceph_file_blockdiff_finish(&info);
+	EXPECT_EQ(0, finish_r)
+	  << "failed to finish blockdiff stream after error " << r;
 	return r;
       }
 
@@ -536,6 +569,9 @@ public:
 	std::cout << " == [" << b->offset << "~" << b->len << "] == " << std::endl;
 	if (expected) {
 	  expected->erase(b->offset, b->len);
+	}
+	if (actual) {
+	  actual->union_insert(b->offset, b->len);
 	}
 	++b;
 	--nr_blocks;
@@ -2046,8 +2082,11 @@ TEST(LibCephFS, SnapDiffCases1_3)
 /*
 * SnapDiff readdir API testing for huge dir
 * when delta is minor.
+*
+* Disabled: the 10000-file snapdiff does not finish under debug mds = 20
+* and blocks the rest of the libcephfs workunit.
 */
-TEST(LibCephFS, HugeSnapDiffSmallDelta)
+TEST(LibCephFS, DISABLED_HugeSnapDiffSmallDelta)
 {
   TestMount test_mount;
 
@@ -2231,12 +2270,111 @@ TEST(LibCephFS, SnapDiffHardlinkReplicaInode)
   ASSERT_EQ(0, test_mount.rmsnap("snap2"));
 }
 
+// A deleted directory is encoded as soon as it is found, while a remote
+// dentry whose inode is not in the MDS cache ends the reply. If both have
+// the same name, the reply must not end between them: the next request
+// resumes after the last name and would never return the new entry.
+TEST(LibCephFS, SnapDiffDeletedDirReplacedByRemoteNotInCache)
+{
+  TestMount test_mount("snapdiff_remote_same_name");
+
+  ASSERT_EQ(0, test_mount.mkdir("d"));
+  ASSERT_EQ(0, test_mount.mkdir("other"));
+  ASSERT_EQ(0, test_mount.setxattr("d", "ceph.dir.pin", "0"));
+  // unrelated entries, so "n" is not alone in the dirfrag
+  for (const char* name : {"d/a", "d/b", "d/c", "d/x", "d/y", "d/z"}) {
+    ASSERT_LE(0, test_mount.write_full(name, name));
+  }
+  ASSERT_EQ(0, test_mount.mkdir("d/n"));
+  ASSERT_LE(0, test_mount.write_full("other/f", "data"));
+  ASSERT_TRUE(test_mount.wait_for_subtree_on_rank("d", "0"));
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  // replace the directory by a hardlink to a file in another directory
+  ASSERT_EQ(0, test_mount.rmdir("d/n"));
+  ASSERT_EQ(0, test_mount.link("other/f", "d/n"));
+  // new entries, so that the reply usually has entries before "n"
+  const int new_files = 8;
+  char path[PATH_MAX];
+  for (int i = 0; i < new_files; i++) {
+    snprintf(path, sizeof(path), "d/new%d", i);
+    ASSERT_LE(0, test_mount.write_full(path, path));
+  }
+  // don't let caps held on the new files add snapshotted dentries
+  test_mount.remount();
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  struct ceph_statx stx;
+  ASSERT_EQ(0, test_mount.statx("other/f", &stx, CEPH_STATX_INO, 0));
+  uint64_t snapid1;
+  uint64_t snapid2;
+  ASSERT_EQ(0, test_mount.get_snapid("snap1", &snapid1));
+  ASSERT_EQ(0, test_mount.get_snapid("snap2", &snapid2));
+
+  // Release the client's caps and drop the hardlinked inode from the MDS
+  // cache, so that the snapdiff of "d" finds the remote dentry unloaded.
+  auto in_mds_cache = [&](uint64_t ino) {
+    cmdmap_t cmdmap;
+    cmdmap["number"] = (int64_t)ino;
+    // there is no JSON output for an inode that is not in the cache
+    auto dump = test_mount.tell_rank0("dump inode", std::move(cmdmap));
+    return dump.type() == json_spirit::obj_type &&
+           dump.get_obj().count("ino") > 0;
+  };
+  auto drop_remote_inode = [&](bool load_deleted_dir) {
+    test_mount.remount();
+    bool dropped = false;
+    for (int attempt = 0; attempt < 10 && !dropped; ++attempt) {
+      if (attempt)
+        sleep(1);
+      ASSERT_FALSE(test_mount.tell_rank0("cache drop").is_null());
+      dropped = !in_mds_cache(stx.stx_ino);
+    }
+    ASSERT_TRUE(dropped) << "inode 0x" << std::hex << stx.stx_ino
+                         << " is still in the MDS cache";
+    if (load_deleted_dir) {
+      // The deleted directory is a remote dentry in the snapshot as well.
+      // Load its inode, so that the reply has entries before the hardlink
+      // and the remote dentry ends it in the middle of the group.
+      struct ceph_statx dir_stx;
+      auto path = test_mount.make_snap_path("snap1", "d/n");
+      ASSERT_EQ(0, test_mount.statx(path.c_str(), &dir_stx,
+                                    CEPH_STATX_INO, 0));
+      ASSERT_FALSE(in_mds_cache(stx.stx_ino));
+    }
+  };
+
+  vector<pair<string, uint64_t>> expected;
+  expected.emplace_back("n", snapid1);
+  expected.emplace_back("n", snapid2);
+  for (int i = 0; i < new_files; i++) {
+    expected.emplace_back("new" + stringify(i), snapid2);
+  }
+
+  for (bool load_deleted_dir : {false, true}) {
+    SCOPED_TRACE(load_deleted_dir ? "deleted dir in cache"
+                                  : "deleted dir not in cache");
+    ASSERT_NO_FATAL_FAILURE(drop_remote_inode(load_deleted_dir));
+    test_mount.verify_snap_diff(expected, "d", "snap1", "snap2");
+
+    ASSERT_NO_FATAL_FAILURE(drop_remote_inode(load_deleted_dir));
+    test_mount.verify_snap_diff(expected, "d", "snap2", "snap1");
+  }
+
+  ASSERT_EQ(0, test_mount.purge_dir(""));
+  ASSERT_EQ(0, test_mount.rmsnap("snap1"));
+  ASSERT_EQ(0, test_mount.rmsnap("snap2"));
+}
+
 TEST(LibCephFS, SnapDiffNoChangeWithUnchangedHead)
 {
   TestMount test_mount;
 
   test_mount.prepareBlockDiffNoChangeWithUnchangedHead();
-  test_mount.for_each_file_blockdiff("fileA", "snap1", "snap2");
+  interval_set<uint64_t> actual;
+  ASSERT_EQ(0, test_mount.for_each_file_blockdiff(
+                 "fileA", "snap1", "snap2", nullptr, &actual));
+  ASSERT_TRUE(actual.empty()) << "unexpected extents: " << actual;
 
   std::cout << "------------- closing -------------" << std::endl;
   ASSERT_EQ(0, test_mount.purge_dir(""));
@@ -2249,10 +2387,181 @@ TEST(LibCephFS, SnapDiffNoChangeWithChangedHead)
   TestMount test_mount;
 
   test_mount.prepareBlockDiffNoChangeWithChangedHead();
-  test_mount.for_each_file_blockdiff("fileA", "snap1", "snap2");
+  interval_set<uint64_t> actual;
+  ASSERT_EQ(0, test_mount.for_each_file_blockdiff(
+                 "fileA", "snap1", "snap2", nullptr, &actual));
+  ASSERT_TRUE(actual.empty()) << "unexpected extents: " << actual;
 
   std::cout << "------------- closing -------------" << std::endl;
   ASSERT_EQ(0, test_mount.purge_dir(""));
+  ASSERT_EQ(0, test_mount.rmsnap("snap1"));
+  ASSERT_EQ(0, test_mount.rmsnap("snap2"));
+}
+
+struct BlockDiffSnapCleanup {
+  TestMount& test_mount;
+  ~BlockDiffSnapCleanup() {
+    test_mount.rmsnap("snap2");
+    test_mount.rmsnap("snap1");
+  }
+};
+
+TEST(LibCephFS, BlockDiffMultiversionHardlink)
+{
+  TestMount test_mount("BlockDiffMultiversionHardlink");
+
+  constexpr uint64_t block_size = 4 * 1024 * 1024;
+  constexpr uint64_t write_offset = 8 * 1024 * 1024;
+  constexpr uint64_t write_length = 1024 * 1024;
+
+  ASSERT_LE(0, test_mount.write_random("fileA", 4, block_size));
+  ASSERT_EQ(0, test_mount.link("fileA", "linkA"));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, write_length,
+                                      write_offset, false));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  for (const char* path : {"fileA", "linkA"}) {
+    interval_set<uint64_t> expected;
+    interval_set<uint64_t> actual;
+    expected.union_insert(write_offset, write_length);
+    ASSERT_EQ(0, test_mount.for_each_file_blockdiff(
+                   path, "snap1", "snap2", nullptr, &actual));
+    ASSERT_EQ(expected, actual) << "unexpected changed extents for " << path;
+  }
+
+  ASSERT_EQ(0, test_mount.rmsnap("snap1"));
+  ASSERT_EQ(0, test_mount.rmsnap("snap2"));
+}
+
+TEST(LibCephFS, BlockDiffMultiversionHardlinkGrowth)
+{
+  TestMount test_mount("BlockDiffHardlinkGrowth");
+  BlockDiffSnapCleanup cleanup{test_mount};
+  constexpr uint64_t object_size = 4 * 1024 * 1024;
+  constexpr uint64_t growth = object_size + 1024 * 1024;
+
+  ASSERT_EQ(0, test_mount.create_file_with_layout("fileA", object_size));
+  ASSERT_EQ(object_size, test_mount.write_random("fileA", 1, object_size, 0));
+  ASSERT_EQ(0, test_mount.link("fileA", "linkA"));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  // Grow from one object to three. Using snap2's size for snap1 would scan
+  // the new objects instead of reporting the extent beyond snap1's EOF.
+  ASSERT_EQ(growth, test_mount.write_random("fileA", 1, growth, object_size));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  // The head size must not be used for either snapshot.
+  ASSERT_EQ(object_size, test_mount.write_random("linkA", 1, object_size,
+                                                 object_size + growth));
+  ASSERT_EQ(0, test_mount.sync());
+
+  for (const char* path : {"fileA", "linkA"}) {
+    interval_set<uint64_t> expected;
+    interval_set<uint64_t> actual;
+    expected.insert(object_size, growth);
+    ASSERT_EQ(0, test_mount.for_each_file_blockdiff(
+                   path, "snap1", "snap2", nullptr, &actual));
+    ASSERT_EQ(expected, actual) << "unexpected changed extents for " << path;
+  }
+}
+
+TEST(LibCephFS, BlockDiffDifferentAuthRanks)
+{
+  TestMount test_mount("BlockDiffDifferentAuthRanks");
+  if (test_mount.tell_rank("1", "status").is_null()) {
+    GTEST_SKIP() << "requires two active MDS ranks";
+  }
+  BlockDiffSnapCleanup cleanup{test_mount};
+  constexpr uint64_t object_size = 4 * 1024 * 1024;
+  constexpr uint64_t write_length = 1024 * 1024;
+
+  ASSERT_EQ(0, test_mount.mkdir("old"));
+  ASSERT_EQ(0, test_mount.mkdir("new"));
+  // Give the destination a dirfrag to export before moving the file.
+  ASSERT_EQ(0, test_mount.mkdir("new/empty"));
+  ASSERT_EQ(0, test_mount.setxattr("", "ceph.dir.pin", "0"));
+  ASSERT_EQ(0, test_mount.setxattr("old", "ceph.dir.pin", "0"));
+  ASSERT_EQ(0, test_mount.setxattr("new", "ceph.dir.pin", "1"));
+  ASSERT_TRUE(test_mount.wait_for_subtree_on_rank("new", "1"));
+
+  ASSERT_EQ(0, test_mount.create_file_with_layout("old/fileA", object_size));
+  ASSERT_EQ(2 * object_size,
+            test_mount.write_random("old/fileA", 2, object_size, 0));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  // COW while the inode still has a single link, leaving a separate snapped
+  // inode in the old parent on rank 0 before the head moves to rank 1.
+  ASSERT_EQ(write_length,
+            test_mount.write_random("old/fileA", 1, write_length, object_size));
+  ASSERT_EQ(0, test_mount.sync());
+
+  // Restore the old pathname with a hardlink so both snapshots contain it.
+  ASSERT_EQ(0, test_mount.rename("old/fileA", "new/fileA"));
+  ASSERT_EQ(0, test_mount.link("new/fileA", "old/fileA"));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  // Grow head after snap2 to distinguish snap2's size from head's size.
+  ASSERT_EQ(object_size,
+            test_mount.write_random("new/fileA", 1, object_size, 2 * object_size));
+  ASSERT_EQ(0, test_mount.sync());
+
+  interval_set<uint64_t> expected;
+  interval_set<uint64_t> actual;
+  expected.insert(0, 2 * object_size);
+  ASSERT_EQ(0, test_mount.for_each_file_blockdiff(
+                 "old/fileA", "snap1", "snap2", nullptr, &actual));
+  ASSERT_EQ(expected, actual);
+}
+
+TEST(LibCephFS, BlockDiffReversedSnapshots)
+{
+  TestMount test_mount("BlockDiffReversedSnapshots");
+
+  constexpr uint64_t block_size = 4 * 1024 * 1024;
+  constexpr uint64_t write_offset = 8 * 1024 * 1024;
+  constexpr uint64_t write_length = 1024 * 1024;
+
+  // fileA is COWed between the snapshots, fileB is not -- the latter makes
+  // both paths resolve to the same CInode.
+  ASSERT_LE(0, test_mount.write_random("fileA", 4, block_size));
+  ASSERT_LE(0, test_mount.write_random("fileB", 4, block_size));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  ASSERT_LE(0, test_mount.write_random("fileA", 1, write_length,
+                                      write_offset, false));
+  ASSERT_EQ(0, test_mount.sync());
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  // Snapshots must be supplied oldest first; the MDS must reject the
+  // request rather than assert.
+  for (const char* path : {"fileA", "fileB"}) {
+    ASSERT_EQ(-EINVAL, test_mount.for_each_file_blockdiff(
+                         path, "snap2", "snap1"))
+      << "expected EINVAL for reversed snapshots on " << path;
+  }
+
+  // ...and still works in the correct order.
+  interval_set<uint64_t> expected;
+  interval_set<uint64_t> actual;
+  expected.union_insert(write_offset, write_length);
+  ASSERT_EQ(0, test_mount.for_each_file_blockdiff(
+                 "fileA", "snap1", "snap2", nullptr, &actual));
+  ASSERT_EQ(expected, actual);
+
+  // Both snapshots select the same inode version for fileB.
+  ASSERT_EQ(0, test_mount.for_each_file_blockdiff(
+                 "fileB", "snap1", "snap2", nullptr, &actual));
+  ASSERT_TRUE(actual.empty()) << "unexpected extents for fileB: " << actual;
+
   ASSERT_EQ(0, test_mount.rmsnap("snap1"));
   ASSERT_EQ(0, test_mount.rmsnap("snap2"));
 }
@@ -2446,4 +2755,117 @@ TEST(LibCephFS, SnapDiffStatDelta) {
 
   test_mount.rmsnap("snap1");
   test_mount.rmsnap("snap2");
+}
+
+// Large xattrs and varying file counts force overflow at the last entry.
+TEST(LibCephFS, SnapDiffDeletedEntryAtFragEnd) {
+  TestMount test_mount("snapdiff_deleted_frag_end");
+
+  const int max_files = 24;
+  const string xattr_value(60000, 'x');
+  char path[PATH_MAX];
+  for (int n = 1; n <= max_files; n++) {
+    snprintf(path, sizeof(path), "d%d", n);
+    ASSERT_EQ(0, test_mount.mkdir(path));
+    for (int i = 0; i < n; i++) {
+      snprintf(path, sizeof(path), "d%d/f%d", n, i);
+      ASSERT_LE(0, test_mount.write_full(path, path));
+      ASSERT_EQ(0, test_mount.setxattr(path, "user.big", xattr_value.c_str()));
+    }
+  }
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  for (int n = 1; n <= max_files; n++) {
+    for (int i = 0; i < n; i++) {
+      snprintf(path, sizeof(path), "d%d/f%d", n, i);
+      ASSERT_EQ(0, test_mount.unlink(path));
+    }
+  }
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  uint64_t snapid1;
+  uint64_t snapid2;
+  ASSERT_EQ(0, test_mount.get_snapid("snap1", &snapid1));
+  ASSERT_EQ(0, test_mount.get_snapid("snap2", &snapid2));
+
+  for (int n = 1; n <= max_files; n++) {
+    vector<pair<string, uint64_t>> expected;
+    for (int i = 0; i < n; i++) {
+      expected.emplace_back("f" + stringify(i), snapid1);
+    }
+    snprintf(path, sizeof(path), "d%d", n);
+    SCOPED_TRACE(path);
+    test_mount.verify_snap_diff(expected, path, "snap1", "snap2");
+  }
+
+  ASSERT_EQ(0, test_mount.rmsnap("snap1"));
+  ASSERT_EQ(0, test_mount.rmsnap("snap2"));
+}
+
+TEST(LibCephFS, SnapDiffCreatedEntryAtFragEnd) {
+  TestMount test_mount("snapdiff_created_frag_end");
+
+  const int max_files = 24;
+  const string xattr_value(60000, 'x');
+  char path[PATH_MAX];
+  for (int n = 1; n <= max_files; n++) {
+    snprintf(path, sizeof(path), "d%d", n);
+    ASSERT_EQ(0, test_mount.mkdir(path));
+  }
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+
+  for (int n = 1; n <= max_files; n++) {
+    for (int i = 0; i < n; i++) {
+      snprintf(path, sizeof(path), "d%d/f%d", n, i);
+      ASSERT_LE(0, test_mount.write_full(path, path));
+      ASSERT_EQ(0, test_mount.setxattr(path, "user.big", xattr_value.c_str()));
+    }
+  }
+  // Drop caps before snap2 to avoid COW adding another head dentry.
+  test_mount.remount();
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  uint64_t snapid1;
+  uint64_t snapid2;
+  ASSERT_EQ(0, test_mount.get_snapid("snap1", &snapid1));
+  ASSERT_EQ(0, test_mount.get_snapid("snap2", &snapid2));
+
+  for (int n = 1; n <= max_files; n++) {
+    vector<pair<string, uint64_t>> expected;
+    for (int i = 0; i < n; i++) {
+      expected.emplace_back("f" + stringify(i), snapid2);
+    }
+    snprintf(path, sizeof(path), "d%d", n);
+    SCOPED_TRACE(path);
+    test_mount.verify_snap_diff(expected, path, "snap1", "snap2");
+  }
+
+  ASSERT_EQ(0, test_mount.rmsnap("snap1"));
+  ASSERT_EQ(0, test_mount.rmsnap("snap2"));
+}
+
+TEST(LibCephFS, SnapDiffRemoteDentryNotInCache) {
+  TestMount test_mount("snapdiff_remote_dentry");
+
+  ASSERT_EQ(0, test_mount.mkdir("primary"));
+  ASSERT_EQ(0, test_mount.mkdir("links"));
+  ASSERT_EQ(0, test_mount.setxattr("links", "ceph.dir.pin", "0"));
+  ASSERT_LE(0, test_mount.write_full("primary/file", "data"));
+  ASSERT_EQ(0, test_mount.mksnap("snap1"));
+  ASSERT_EQ(0, test_mount.link("primary/file", "links/link"));
+  // Empty directories are not exported.
+  ASSERT_TRUE(test_mount.wait_for_subtree_on_rank("links", "0"));
+  ASSERT_EQ(0, test_mount.mksnap("snap2"));
+
+  test_mount.remount();
+  ASSERT_FALSE(test_mount.tell_rank0("cache drop").is_null());
+
+  uint64_t snapid2;
+  ASSERT_EQ(0, test_mount.get_snapid("snap2", &snapid2));
+  vector<pair<string, uint64_t>> expected;
+  expected.emplace_back("link", snapid2);
+  test_mount.verify_snap_diff(expected, "links", "snap1", "snap2");
+
+  ASSERT_EQ(0, test_mount.rmsnap("snap1"));
+  ASSERT_EQ(0, test_mount.rmsnap("snap2"));
 }

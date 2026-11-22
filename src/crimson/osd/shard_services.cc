@@ -11,6 +11,7 @@
 #include "messages/MOSDPGTemp.h"
 #include "messages/MOSDPGReadyToMerge.h"
 #include "messages/MOSDPGStopMerge.h"
+#include "messages/MOSDPGMigratedPool.h"
 
 #include "osd/osd_perf_counters.h"
 #include "osd/PeeringState.h"
@@ -79,12 +80,21 @@ std::map<pg_t, pg_stat_t> PerShardState::get_pg_stats()
   assert_core();
   std::map<pg_t, pg_stat_t> ret;
   for (auto [pgid, pg] : pg_map.get_pgs()) {
-    if (pg->is_primary()) {
-      auto stats = pg->get_stats();
-      // todo: update reported_epoch,reported_seq,last_fresh
-      stats.reported_epoch = osdmap->get_epoch();
-      ret.emplace(pgid.pgid, std::move(stats));
+    if (!pg->is_primary()) {
+      continue;
     }
+    auto stats = pg->get_stats();
+    if (!stats) {
+      // Nothing published yet in this interval. Reporting a
+      // default-constructed pg_stat_t would make the mgr replace the
+      // PG's last known stats with zeroes: state 'unknown', no objects,
+      // and scrub stamps of 0, which raise PG_NOT_SCRUBBED and
+      // PG_NOT_DEEP_SCRUBBED. Skip the PG, as the classic OSD does.
+      continue;
+    }
+    // todo: update reported_epoch,reported_seq,last_fresh
+    stats->reported_epoch = osdmap->get_epoch();
+    ret.emplace(pgid.pgid, std::move(*stats));
   }
   return ret;
 }
@@ -290,7 +300,11 @@ OSDSingletonState::OSDSingletonState(
     snap_reserver(
       &cct,
       &finisher,
-      crimson::common::local_conf()->osd_max_trimming_pgs)
+      crimson::common::local_conf()->osd_max_trimming_pgs),
+    scrub_reserver(
+      &cct,
+      &finisher,
+      crimson::common::local_conf()->osd_max_scrubs)
 {
   crimson::common::local_conf().add_observer(this);
   osdmaps[0] = boost::make_local_shared<OSDMap>();
@@ -714,6 +728,16 @@ void OSDSingletonState::prune_sent_ready_to_merge()
   }
 }
 
+seastar::future<> OSDSingletonState::send_pg_migrated_pool(int64_t migration_target, pg_t pgid)
+{
+  LOG_PREFIX(OSDSingletonState::send_pg_to_migrated_pool);
+  DEBUG("{}", pgid);
+  return monc.send_message(
+    crimson::make_message<MOSDPGMigratedPool>(osdmap->get_epoch(),
+					      migration_target,
+					      pgid));
+}
+
 seastar::future<> OSDSingletonState::send_alive(const epoch_t want)
 {
   LOG_PREFIX(OSDSingletonState::send_alive);
@@ -743,7 +767,8 @@ std::vector<std::string> OSDSingletonState::get_tracked_keys() const noexcept
   return {
     "osd_max_backfills"s,
     "osd_min_recovery_priority"s,
-    "osd_max_trimming_pgs"s
+    "osd_max_trimming_pgs"s,
+    "osd_max_scrubs"s
   };
 }
 
@@ -761,6 +786,9 @@ void OSDSingletonState::handle_conf_change(
   }
   if (changed.count("osd_max_trimming_pgs")) {
     snap_reserver.set_max(conf->osd_max_trimming_pgs);
+  }
+  if (changed.count("osd_max_scrubs")) {
+    scrub_reserver.set_max(conf->osd_max_scrubs);
   }
 }
 
@@ -962,6 +990,19 @@ void OSDSingletonState::trim_maps(ceph::os::Transaction& t,
   // we should not trim past osdmaps.cached_key_lower_bound()
   // as there may still be PGs with those map epochs recorded.
   ceph_assert(min <= osdmaps.cached_key_lower_bound());
+}
+
+seastar::future<> ShardServices::prepare_scrub()
+{
+  LOG_PREFIX(ShardServices::prepare_scrub);
+  DEBUG("scrub timer is expired. Checking if we can start scrub...");
+  if (!local_state.osd_state.is_active()) {
+    DEBUG("shard not active, skipping scrub preparation");
+    co_return;
+  }
+  auto active = co_await is_recovery_active();
+  DEBUG("is recovery active? {}", active);
+  co_return co_await scrub_scheduler.initiate_scrub(active);
 }
 
 seastar::future<Ref<PG>> ShardServices::make_pg(

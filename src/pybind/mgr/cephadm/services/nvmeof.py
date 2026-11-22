@@ -1,7 +1,7 @@
 import errno
 import logging
 import json
-from typing import List, cast, Optional, NamedTuple, TYPE_CHECKING
+from typing import Dict, List, cast, Optional, NamedTuple, TYPE_CHECKING, Any
 from ipaddress import ip_address, IPv6Address
 from dataclasses import replace
 
@@ -83,12 +83,30 @@ class NvmeofService(CephService):
             return []
 
         nvmeof_spec = cast(NvmeofServiceSpec, spec)
-        if not nvmeof_spec.encryption_key:
-            return []
-
-        return [
-            f'encryption_key:{utils.config_hash(nvmeof_spec.encryption_key)}'
-        ]
+        deps: List[str] = []
+        if nvmeof_spec.encryption_key:
+            deps.append(f'encryption_key:{utils.config_hash(nvmeof_spec.encryption_key)}')
+        # The declarations bind_addr reads. A gateway keeps the address it
+        # was deployed with, so moving one has to reach the daemon as a
+        # reconfig. `networks` is not here: the address it resolves to
+        # lands on the placement, which the scheduler already compares
+        # against the daemon it deployed.
+        #
+        # Only what is set, so a spec that declares no address at all
+        # carries the deps it carried before and upgrading to this does
+        # not reconfigure it. A map renders in insertion order, which a
+        # reload of the spec need not repeat, so sort it: deps that differ
+        # from one pass to the next reconfigure on every pass.
+        if nvmeof_spec.addr:
+            deps.append(f'addr: {nvmeof_spec.addr}')
+        if nvmeof_spec.addr_map:
+            deps.append(f'addr_map: {sorted(nvmeof_spec.addr_map.items())}')
+        if nvmeof_spec.discovery_addr:
+            deps.append(f'discovery_addr: {nvmeof_spec.discovery_addr}')
+        if nvmeof_spec.discovery_addr_map:
+            deps.append(
+                f'discovery_addr_map: {sorted(nvmeof_spec.discovery_addr_map.items())}')
+        return deps
 
     def choose_next_action(
         self,
@@ -168,6 +186,24 @@ class NvmeofService(CephService):
             'root_ca_cert': tls_creds.ca_cert,
         })
 
+    def bind_addr(self,
+                  listener: str,
+                  host: str,
+                  placement_addr: Optional[str],
+                  addr_map: Optional[Dict[str, str]],
+                  addr: Optional[str]) -> str:
+        """Where a gateway's `listener` listens on `host`: the per host map,
+        then the service wide address, then what the scheduler resolved for the
+        placement from `networks`, and only then the address cephadm reaches
+        the host at.
+        """
+        mapped_addr = addr_map.get(host) if addr_map else None
+        host_addr = self.mgr.inventory.get_addr(host)
+        chosen = mapped_addr or addr or placement_addr or host_addr
+        self.mgr.log.info(f'{listener} address on {host}: {chosen}, from '
+                          f'{mapped_addr=} {addr=} {placement_addr=} {host_addr=}')
+        return chosen
+
     def prepare_create(
             self,
             deploy_ctx: DaemonDeployContext,
@@ -179,9 +215,6 @@ class NvmeofService(CephService):
         spec = cast(NvmeofServiceSpec, self.mgr.spec_store[daemon_spec.service_name].spec)
         deploy_ctx.service_spec = spec
         nvmeof_gw_id = daemon_spec.daemon_id
-        host_ip = self.mgr.inventory.get_addr(daemon_spec.host)
-        map_addr = spec.addr_map.get(daemon_spec.host) if spec.addr_map else None
-        map_discovery_addr = spec.discovery_addr_map.get(daemon_spec.host) if spec.discovery_addr_map else None
         keyring = self.get_keyring_with_caps(self.get_auth_entity(nvmeof_gw_id),
                                              ['mon', 'profile rbd',
                                               'mgr', 'allow command "service dump"',
@@ -198,13 +231,10 @@ class NvmeofService(CephService):
         name = f'{utils.name_to_config_section(self.TYPE)}.{nvmeof_gw_id}'
         rados_id = name[len('client.'):] if name.startswith('client.') else name
 
-        # The address is first searched in the per node address map,
-        # then in the spec address configuration.
-        # If neither is defined, the host IP is used as a fallback.
-        addr = map_addr or spec.addr or host_ip
-        self.mgr.log.info(f"gateway address: {addr} from {map_addr=} {spec.addr=} {host_ip=}")
-        discovery_addr = map_discovery_addr or spec.discovery_addr or host_ip
-        self.mgr.log.info(f"discovery address: {discovery_addr} from {map_discovery_addr=} {spec.discovery_addr=} {host_ip=}")
+        addr = self.bind_addr('gateway', daemon_spec.host, daemon_spec.ip,
+                              spec.addr_map, spec.addr)
+        discovery_addr = self.bind_addr('discovery', daemon_spec.host, daemon_spec.ip,
+                                        spec.discovery_addr_map, spec.discovery_addr)
         encryption_key_path = self._get_encryption_key_path(spec)
         context = {
             'spec': spec,
@@ -300,7 +330,16 @@ class NvmeofService(CephService):
                     logger.warning(f'No ServiceSpec found for {service_name}')
                     continue
 
-                ip = utils.resolve_ip(self.mgr.inventory.get_addr(dd.hostname))
+                # Register where the gateway listens, not where cephadm reaches
+                # the host, or the mgr dials an address nothing is bound to.
+                ip = utils.resolve_ip(
+                    self.bind_addr('gateway', dd.hostname, dd.ip,
+                                   spec.addr_map, spec.addr))
+                if ip_address(ip).is_unspecified:
+                    # a wildcard listener takes in every interface and so names
+                    # none of them. The host address is one it answers on, and
+                    # the mgr already reaches the host there.
+                    ip = utils.resolve_ip(self.mgr.inventory.get_addr(dd.hostname))
                 if type(ip_address(ip)) is IPv6Address:
                     ip = f'[{ip}]'
                 service_url = '{}:{}'.format(ip, spec.port or '5500')
@@ -322,29 +361,239 @@ class NvmeofService(CephService):
             get_set_cmd_dicts=get_set_cmd_dicts
         )
 
-    def ok_to_stop(self,
-                   daemon_ids: List[str],
-                   force: bool = False,
-                   known: Optional[List[str]] = None) -> HandleCommandResult:
-        # if only 1 nvmeof, alert user (this is not passable with --force)
-        warn, warn_message = self._enough_daemons_to_stop(self.TYPE, daemon_ids, 'Nvmeof', 1, True)
-        if warn:
-            return HandleCommandResult(-errno.EBUSY, '', warn_message)
+    def ok_to_stop(
+        self,
+        daemon_ids: List[str],
+        force: bool = False,
+        known: Optional[List[str]] = None,
+    ) -> HandleCommandResult:
+        daemon_ids_set = set(daemon_ids)
+        daemons = [
+            daemon
+            for daemon in self.mgr.cache.get_daemons_by_type(self.TYPE)
+            if daemon.daemon_id in daemon_ids_set
+        ]
 
-        # if reached here, there is > 1 nvmeof daemon. make sure none are down
-        if not force:
-            warn_message = ('WARNING: Only one nvmeof daemon is running. Please bring another nvmeof daemon up before stopping the current one.')
-            unreachable_hosts = [h.hostname for h in self.mgr.cache.get_unreachable_hosts()]
-            running_nvmeof_daemons = [
-                d for d in self.mgr.cache.get_daemons_by_type(self.TYPE)
-                if d.status == DaemonDescriptionStatus.running and d.hostname not in unreachable_hosts
-            ]
-            if len(running_nvmeof_daemons) < 2:
-                return HandleCommandResult(-errno.EBUSY, '', warn_message)
+        if len(daemons) != len(daemon_ids_set):
+            found = {daemon.daemon_id for daemon in daemons}
+            missing = daemon_ids_set - found
+            return HandleCommandResult(
+                -errno.EINVAL,
+                '',
+                f'Unable to find nvmeof daemon(s): {sorted(missing)}',
+            )
 
-        names = [f'{self.TYPE}.{d_id}' for d_id in daemon_ids]
-        warn_message = f'It is presumed safe to stop {names}'
-        return HandleCommandResult(0, warn_message, '')
+        groups: List[tuple[str, str]] = []
+        seen_groups: set[tuple[str, str]] = set()
+
+        for daemon in daemons:
+            spec = self._get_gateway_spec(daemon)
+            if not spec:
+                return HandleCommandResult(
+                    -errno.EINVAL,
+                    '',
+                    f'Unable to find service spec for {daemon.service_name()}',
+                )
+
+            gateway_group = (spec.pool, spec.group)
+            if gateway_group in seen_groups:
+                return HandleCommandResult(
+                    -errno.EBUSY,
+                    '',
+                    f'It is not safe to stop more than one nvmeof gateway '
+                    f'from pool {spec.pool}, group {spec.group} at the same time',
+                )
+
+            seen_groups.add(gateway_group)
+            groups.append(gateway_group)
+
+        for pool, group_name in groups:
+            result, _ = self._mon_ok_to_stop(pool, group_name)
+            if result.retval:
+                return result
+
+        names = [f'{self.TYPE}.{daemon_id}' for daemon_id in daemon_ids]
+        return HandleCommandResult(
+            0,
+            f'It is safe to stop {names}',
+            '',
+        )
+
+    def ok_to_redeploy(
+        self,
+        daemon: DaemonDescription,
+        already_redeployed_groups: set[tuple[str, str]],
+        force: bool = False,
+    ) -> tuple[
+        HandleCommandResult,
+        Optional[tuple[str, str]],
+        bool,
+    ]:
+        if daemon.daemon_id is None:
+            return (
+                HandleCommandResult(
+                    -errno.EINVAL,
+                    '',
+                    'Unable to redeploy NVMe-oF daemon without a daemon id',
+                ),
+                None,
+                False,
+            )
+
+        spec = self._get_gateway_spec(daemon)
+        if not spec:
+            return (
+                HandleCommandResult(
+                    -errno.EINVAL,
+                    '',
+                    f'Unable to find NVMe-oF service spec for {daemon.name()}',
+                ),
+                None,
+                False,
+            )
+
+        group = (spec.pool, spec.group)
+
+        if group in already_redeployed_groups:
+            return (
+                HandleCommandResult(
+                    -errno.EBUSY,
+                    '',
+                    f'Another gateway from pool {spec.pool}, group {spec.group} '
+                    f'was already redeployed in this serve iteration',
+                ),
+                group,
+                False,
+            )
+
+        if force or daemon.status != DaemonDescriptionStatus.running:
+            return HandleCommandResult(0, '', ''), group, False
+
+        result, gateway_disabled = self.check_and_disable_gateway(daemon)
+        return (
+            result,
+            group,
+            gateway_disabled if not result.retval else False,
+        )
+
+    def _gateway_id(self, daemon: DaemonDescription) -> str:
+        assert daemon.daemon_id is not None
+        return f'{utils.name_to_config_section(self.TYPE)}.{daemon.daemon_id}'
+
+    def _get_gateway_spec(
+        self,
+        daemon: DaemonDescription,
+    ) -> Optional[NvmeofServiceSpec]:
+        spec = self.mgr.spec_store.all_specs.get(daemon.service_name())
+        return cast(Optional[NvmeofServiceSpec], spec)
+
+    def _mon_ok_to_stop(
+        self,
+        pool: str,
+        group: str,
+        gw_id: Optional[str] = None,
+    ) -> tuple[HandleCommandResult, bool]:
+        cmd: dict[str, Any] = {
+            'prefix': 'nvme-gw ok-to-stop',
+            'pool': pool,
+            'group': group,
+        }
+
+        if gw_id is not None:
+            cmd['id'] = gw_id
+            cmd['disable-if-ok'] = True
+
+        ret, out, err = self.mgr.mon_command(cmd)
+
+        if ret == -errno.ENOENT:
+            logger.info(
+                'NVMe-oF gateway for pool %s, group %s is not known to MON; '
+                'treating it as safe to stop',
+                pool,
+                group,
+            )
+            return HandleCommandResult(0, '', ''), False
+
+        if ret == -errno.EALREADY and gw_id is not None:
+            logger.info(
+                'NVMe-oF gateway %s is already administratively disabled; '
+                'proceeding without re-enabling it after the daemon action',
+                gw_id,
+            )
+            return HandleCommandResult(0, out, ''), False
+
+        if ret:
+            return HandleCommandResult(ret, out, err), False
+
+        # With id + disable-if-ok=true, a successful command means
+        # MON also administratively disabled the gateway.
+        return HandleCommandResult(0, out, ''), gw_id is not None
+
+    def check_and_disable_gateway(
+        self,
+        daemon: DaemonDescription,
+    ) -> tuple[HandleCommandResult, bool]:
+        if daemon.daemon_id is None:
+            return (
+                HandleCommandResult(
+                    -errno.EINVAL,
+                    '',
+                    'Unable to check NVMe-oF gateway without a daemon id',
+                ),
+                False,
+            )
+
+        spec = self._get_gateway_spec(daemon)
+        if not spec:
+            return (
+                HandleCommandResult(
+                    -errno.EINVAL,
+                    '',
+                    f'Unable to find NVMe-oF service spec for {daemon.name()}',
+                ),
+                False,
+            )
+
+        return self._mon_ok_to_stop(
+            spec.pool,
+            spec.group,
+            gw_id=self._gateway_id(daemon),
+        )
+
+    def enable_gateway(
+        self,
+        daemon: DaemonDescription,
+    ) -> HandleCommandResult:
+        if daemon.daemon_id is None:
+            return HandleCommandResult(
+                -errno.EINVAL,
+                '',
+                'Unable to enable NVMe-oF gateway without a daemon id',
+            )
+
+        spec = self._get_gateway_spec(daemon)
+        if not spec:
+            return HandleCommandResult(
+                -errno.EINVAL,
+                '',
+                f'Unable to find NVMe-oF service spec for {daemon.name()}',
+            )
+
+        gw_id = self._gateway_id(daemon)
+        ret, out, err = self.mgr.mon_command({
+            'prefix': 'nvme-gw enable',
+            'id': gw_id,
+            'pool': spec.pool,
+            'group': spec.group,
+        })
+
+        if not ret:
+            logger.info(
+                'Enabled NVMe-oF gateway %s after daemon action',
+                gw_id,
+            )
+
+        return HandleCommandResult(ret, out, err if ret else '')
 
     def ignore_possible_stray(
         self, service_type: str, daemon_id: str, name: str

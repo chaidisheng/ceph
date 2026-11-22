@@ -1,5 +1,6 @@
 import asyncio
 import json
+import errno
 import logging
 
 from contextlib import contextmanager
@@ -22,7 +23,6 @@ try:
     from typing import List
 except ImportError:
     pass
-
 from ceph.deployment.service_spec import (
     CustomConfig,
     CustomContainerSpec,
@@ -33,6 +33,7 @@ from ceph.deployment.service_spec import (
     PlacementSpec,
     RGWSpec,
     ServiceSpec,
+    NvmeofServiceSpec,
 )
 from ceph.deployment.drive_selection.selector import DriveSelection
 from ceph.deployment.inventory import Devices, Device
@@ -627,6 +628,157 @@ class TestCephadm(object):
 
                 _save_host.assert_called_with('test')
                 assert cephadm_module.cache.get_scheduled_daemon_action('test', daemon_name) is None
+
+    @mock.patch(
+        "cephadm.serve.CephadmServe._run_cephadm",
+        _run_cephadm('{}'),
+    )
+    def test_schedule_forced_redeploy_stores_force(
+        self, cephadm_module: CephadmOrchestrator,
+    ):
+        with with_host(cephadm_module, 'test'):
+            with with_service(
+                cephadm_module,
+                ServiceSpec(service_type='grafana'),
+                CephadmOrchestrator.apply_grafana,
+                'test',
+            ) as d_names:
+                [daemon_name] = d_names
+
+                cephadm_module._schedule_daemon_action(
+                    daemon_name,
+                    'redeploy',
+                    force=True,
+                )
+
+                assert (
+                    cephadm_module.cache.get_scheduled_daemon_action(
+                        'test',
+                        daemon_name,
+                    )
+                    == 'redeploy'
+                )
+
+                assert (
+                    cephadm_module.cache
+                    .get_scheduled_daemon_action_force(
+                        'test',
+                        daemon_name,
+                    )
+                    is True
+                )
+
+    @mock.patch(
+        "cephadm.serve.CephadmServe._run_cephadm",
+        _run_cephadm('{}'),
+    )
+    def test_non_force_redeploy_preserves_existing_force(
+        self, cephadm_module: CephadmOrchestrator,
+    ):
+        with with_host(cephadm_module, 'test'):
+            with with_service(
+                cephadm_module,
+                ServiceSpec(service_type='grafana'),
+                CephadmOrchestrator.apply_grafana,
+                'test',
+            ) as d_names:
+                [daemon_name] = d_names
+
+                cephadm_module._schedule_daemon_action(
+                    daemon_name,
+                    'redeploy',
+                    force=True,
+                )
+
+                assert (
+                    cephadm_module.cache
+                    .get_scheduled_daemon_action_force(
+                        'test',
+                        daemon_name,
+                    )
+                    is True
+                )
+
+                # A later normal redeploy request must not downgrade
+                # an already-forced redeploy.
+                cephadm_module._schedule_daemon_action(
+                    daemon_name,
+                    'redeploy',
+                )
+
+                assert (
+                    cephadm_module.cache.get_scheduled_daemon_action(
+                        'test',
+                        daemon_name,
+                    )
+                    == 'redeploy'
+                )
+
+                assert (
+                    cephadm_module.cache
+                    .get_scheduled_daemon_action_force(
+                        'test',
+                        daemon_name,
+                    )
+                    is True
+                )
+
+    @mock.patch(
+        "cephadm.serve.CephadmServe._run_cephadm",
+        _run_cephadm('{}'),
+    )
+    def test_remove_scheduled_redeploy_clears_force(
+        self,
+        cephadm_module: CephadmOrchestrator,
+    ):
+        with with_host(cephadm_module, 'test'):
+            with with_service(
+                cephadm_module,
+                ServiceSpec(service_type='grafana'),
+                CephadmOrchestrator.apply_grafana,
+                'test',
+            ) as d_names:
+                [daemon_name] = d_names
+
+                cephadm_module._schedule_daemon_action(
+                    daemon_name,
+                    'redeploy',
+                    force=True,
+                )
+
+                assert (
+                    cephadm_module.cache
+                    .get_scheduled_daemon_action_force(
+                        'test',
+                        daemon_name,
+                    )
+                    is True
+                )
+
+                removed = (
+                    cephadm_module.cache.rm_scheduled_daemon_action(
+                        'test',
+                        daemon_name,
+                    )
+                )
+
+                assert removed is True
+
+                assert (
+                    cephadm_module.cache.get_scheduled_daemon_action(
+                        'test',
+                        daemon_name,
+                    )
+                    is None
+                )
+
+                assert not (
+                    cephadm_module.cache
+                    .get_scheduled_daemon_action_force(
+                        'test',
+                        daemon_name,
+                    )
+                )
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
     def test_osd_check_daemons_skip_when_not_ok_to_stop(
@@ -2062,6 +2214,83 @@ class TestCephadm(object):
             assert 'Failed to apply 1 service(s)' in cephadm_module.health_checks[
                 'CEPHADM_APPLY_SPEC_FAIL']['summary']
 
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
+    @mock.patch('cephadm.services.osd.OSDService.create_single_host')
+    @mock.patch('cephadm.services.osd.OSDService.driveselection_to_ceph_volume')
+    @mock.patch('cephadm.services.osd.OsdIdClaims.refresh', lambda _: None)
+    @mock.patch('cephadm.services.osd.OsdIdClaims.get', lambda _: {})
+    @mock.patch('cephadm.inventory.HostCache.osdspec_needs_apply', lambda *_: True)
+    @pytest.mark.parametrize('failing_hosts', [['host2'], ['host1', 'host2']])
+    def test_apply_osd_spec_fail_health_warning(self, d_to_cv, create_single_host,
+                                                _run_cephadm, failing_hosts,
+                                                cephadm_module: CephadmOrchestrator):
+        # A failure on any host while applying an OSD spec must be surfaced
+        # as CEPHADM_APPLY_SPEC_FAIL, while hosts that succeeded still record
+        # their last-applied timestamp.
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+        d_to_cv.return_value = ['lvm batch --no-auto /dev/sdb']
+        failing_hosts = list(failing_hosts)
+
+        async def _create_single_host(drive_group, host, *args, **kwargs):
+            if host in failing_hosts:
+                raise RuntimeError(f'cephadm exited with an error code: 1, stderr: boom on {host}')
+            return f'Created osd(s) 0 on host \'{host}\''
+        create_single_host.side_effect = _create_single_host
+
+        all_hosts = ['host1', 'host2', 'host3']
+        with with_host(cephadm_module, 'host1'), \
+                with_host(cephadm_module, 'host2'), \
+                with_host(cephadm_module, 'host3'):
+            spec = DriveGroupSpec(service_id='foo',
+                                  placement=PlacementSpec(host_pattern='*'),
+                                  data_devices=DeviceSelection(all=True))
+            cephadm_module.spec_store.save(spec)
+
+            CephadmServe(cephadm_module)._apply_all_services()
+
+            # every host was attempted, even after a failure
+            assert sorted(c.args[1] for c in create_single_host.call_args_list) == all_hosts
+
+            hc = cephadm_module.health_checks.get('CEPHADM_APPLY_SPEC_FAIL')
+            assert hc is not None
+            assert hc['count'] == 1
+            assert 'Failed to apply 1 service(s): osd.foo' in hc['summary']
+            detail = '\n'.join(hc['detail'])
+            assert 'osd.foo:' in detail
+            # the first failure is surfaced (with the original ceph-volume error)
+            assert any(f'boom on {h}' in detail for h in failing_hosts)
+
+            for h in all_hosts:
+                applied = cephadm_module.cache.osdspec_last_applied.get(h, {})
+                if h in failing_hosts:
+                    assert 'osd.foo' not in applied
+                else:
+                    assert 'osd.foo' in applied
+
+            # once the hosts recover, the warning is cleared on the next pass
+            failing_hosts.clear()
+            CephadmServe(cephadm_module)._apply_all_services()
+            assert cephadm_module.health_checks.get('CEPHADM_APPLY_SPEC_FAIL') is None
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
+    @mock.patch('cephadm.services.osd.OSDService.create_single_host')
+    @mock.patch('cephadm.services.osd.OSDService.driveselection_to_ceph_volume')
+    @mock.patch('cephadm.services.osd.OsdIdClaims.refresh', lambda _: None)
+    @mock.patch('cephadm.services.osd.OsdIdClaims.get', lambda _: {})
+    def test_daemon_add_osd_reports_failure(self, d_to_cv, create_single_host, cephadm_module):
+        # 'ceph orch daemon add osd' must not report success when ceph-volume
+        # refused the device.
+        d_to_cv.return_value = ['lvm batch --no-auto /dev/sdb']
+        create_single_host.side_effect = RuntimeError(
+            'cephadm exited with an error code: 1, stderr: device /dev/sdb is unavailable')
+        with with_host(cephadm_module, 'test'):
+            dg = DriveGroupSpec(placement=PlacementSpec(host_pattern='test'),
+                                data_devices=DeviceSelection(paths=['/dev/sdb']))
+            # handle_orch_error re-raises under UNITTEST; in production the
+            # exception is returned in the OrchResult and the CLI exits non-zero.
+            with pytest.raises(RuntimeError, match='device /dev/sdb is unavailable'):
+                wait(cephadm_module, cephadm_module.create_osds(dg))
+
     @mock.patch("cephadm.module.CephadmOrchestrator.get_foreign_ceph_option")
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
     @mock.patch("cephadm.module.HostCache.save_host_devices")
@@ -3045,6 +3274,43 @@ Traceback (most recent call last):
                           no_fsid=False, error_ok=False, log_output=False, use_current_daemon_image=False),
             ]
 
+    @mock.patch("cephadm.ssh.SSHManager._remote_connection")
+    @mock.patch("cephadm.ssh.SSHManager._execute_command")
+    @mock.patch("cephadm.ssh.SSHManager._check_execute_command")
+    def test_run_cephadm_error_includes_host(
+        self, check_execute_command, execute_command, remote_connection,
+        cephadm_module: CephadmOrchestrator,
+    ):
+        """OrchestratorError from _run_cephadm must name the host while
+        keeping the existing 'cephadm exited with an error code:' prefix
+        that callers match on.
+        """
+        remote_connection.side_effect = async_side_effect(mock.Mock())
+        check_execute_command.side_effect = async_side_effect('/usr/bin/python3')
+        # Succeed check-host during add_host; fail the explicit error_ok=False call.
+        responses = [
+            ('', '', 0),
+            ('', 'boom', 1),
+        ]
+
+        async def _execute_seq(host, cmd, *args, **kwargs):
+            if responses:
+                return responses.pop(0)
+            return ('', '', 0)
+
+        execute_command.side_effect = _execute_seq
+
+        with with_host(cephadm_module, 'test', refresh_hosts=False):
+            with pytest.raises(OrchestratorError) as err:
+                cephadm_module.wait_async(
+                    CephadmServe(cephadm_module)._run_cephadm(
+                        'test', cephadmNoImage, 'ls', [],
+                        error_ok=False, no_fsid=True))
+            msg = str(err.value)
+            assert msg.startswith('cephadm exited with an error code: 1')
+            assert 'on host test' in msg
+            assert 'stderr: boom' in msg
+
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
     def test_osd_activate_datadevice(self, _run_cephadm, cephadm_module: CephadmOrchestrator):
         _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
@@ -3692,6 +3958,358 @@ Traceback (most recent call last):
                 assert wait(cephadm_module, c) == ['Scheduled osd.foo update...']
 
                 cephadm_module.set_osd_spec('osd.foo', ['1'])
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
+    def test_nvmeof_check_daemons_redeploy_disables_and_reenables(
+        self,
+        _run_cephadm,
+        cephadm_module: CephadmOrchestrator,
+    ):
+        from mgr_module import HandleCommandResult
+
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+
+        spec = NvmeofServiceSpec(
+            service_id='testpool.testgroup',
+            pool='testpool',
+            group='testgroup',
+        )
+
+        cephadm_module.mock_store_set(
+            '_ceph_get',
+            'osd_map',
+            {
+                'pools': [
+                    {
+                        'pool': 1,
+                        'pool_name': 'testpool',
+                        'type': 1,
+                    },
+                ],
+            },
+        )
+
+        with with_host(cephadm_module, 'test'):
+            with with_service(cephadm_module, spec):
+                [dd] = cephadm_module.cache.get_daemons_by_type(
+                    'nvmeof'
+                )
+
+                cephadm_module._schedule_daemon_action(
+                    dd.name(),
+                    'redeploy',
+                )
+
+                nvmeof_service = service_registry.get_service(
+                    'nvmeof'
+                )
+
+                with mock.patch.object(
+                    nvmeof_service,
+                    'ok_to_redeploy',
+                    return_value=(
+                        HandleCommandResult(0, '', ''),
+                        ('testpool', 'testgroup'),
+                        True,
+                    ),
+                ) as mock_ok_to_redeploy, mock.patch.object(
+                    nvmeof_service,
+                    'enable_gateway',
+                    return_value=HandleCommandResult(
+                        0,
+                        '',
+                        '',
+                    ),
+                ) as mock_enable_gateway, mock.patch.object(
+                    cephadm_module,
+                    '_daemon_action',
+                ) as mock_daemon_action:
+                    CephadmServe(
+                        cephadm_module
+                    )._check_daemons()
+
+                mock_ok_to_redeploy.assert_called_once()
+
+                assert (
+                    mock_ok_to_redeploy.call_args.kwargs[
+                        'force'
+                    ]
+                    is False
+                )
+
+                mock_daemon_action.assert_called_once()
+                mock_enable_gateway.assert_called_once_with(dd)
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
+    def test_nvmeof_check_daemons_redeploy_deferred_when_not_safe(
+        self,
+        _run_cephadm,
+        cephadm_module: CephadmOrchestrator,
+    ):
+        from mgr_module import HandleCommandResult
+
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+
+        spec = NvmeofServiceSpec(
+            service_id='testpool.testgroup',
+            pool='testpool',
+            group='testgroup',
+        )
+
+        cephadm_module.mock_store_set(
+            '_ceph_get',
+            'osd_map',
+            {
+                'pools': [
+                    {
+                        'pool': 1,
+                        'pool_name': 'testpool',
+                        'type': 1,
+                    },
+                ],
+            },
+        )
+
+        with with_host(cephadm_module, 'test'):
+            with with_service(cephadm_module, spec):
+                [dd] = cephadm_module.cache.get_daemons_by_type(
+                    'nvmeof'
+                )
+
+                cephadm_module._schedule_daemon_action(
+                    dd.name(),
+                    'redeploy',
+                )
+
+                nvmeof_service = service_registry.get_service(
+                    'nvmeof'
+                )
+
+                with mock.patch.object(
+                    nvmeof_service,
+                    'ok_to_redeploy',
+                    return_value=(
+                        HandleCommandResult(
+                            -errno.EBUSY,
+                            '',
+                            'not safe to stop nvmeof gateway',
+                        ),
+                        ('testpool', 'testgroup'),
+                        False,
+                    ),
+                ) as mock_ok_to_redeploy, mock.patch.object(
+                    nvmeof_service,
+                    'enable_gateway',
+                ) as mock_enable_gateway, mock.patch.object(
+                    cephadm_module,
+                    '_daemon_action',
+                ) as mock_daemon_action:
+                    CephadmServe(
+                        cephadm_module
+                    )._check_daemons()
+
+                mock_ok_to_redeploy.assert_called_once()
+                mock_daemon_action.assert_not_called()
+                mock_enable_gateway.assert_not_called()
+
+                # The action was deferred, so it should remain
+                # scheduled for a later serve iteration.
+                assert (
+                    cephadm_module.cache.get_scheduled_daemon_action(
+                        'test',
+                        dd.name(),
+                    )
+                    == 'redeploy'
+                )
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
+    def test_nvmeof_check_daemons_force_redeploy_passes_force(
+        self,
+        _run_cephadm,
+        cephadm_module: CephadmOrchestrator,
+    ):
+        from mgr_module import HandleCommandResult
+
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+
+        spec = NvmeofServiceSpec(
+            service_id='testpool.testgroup',
+            pool='testpool',
+            group='testgroup',
+        )
+
+        cephadm_module.mock_store_set(
+            '_ceph_get',
+            'osd_map',
+            {
+                'pools': [
+                    {
+                        'pool': 1,
+                        'pool_name': 'testpool',
+                        'type': 1,
+                    },
+                ],
+            },
+        )
+
+        with with_host(cephadm_module, 'test'):
+            with with_service(cephadm_module, spec):
+                [dd] = cephadm_module.cache.get_daemons_by_type(
+                    'nvmeof'
+                )
+
+                cephadm_module._schedule_daemon_action(
+                    dd.name(),
+                    'redeploy',
+                    force=True,
+                )
+
+                nvmeof_service = service_registry.get_service(
+                    'nvmeof'
+                )
+
+                with mock.patch.object(
+                    nvmeof_service,
+                    'ok_to_redeploy',
+                    return_value=(
+                        HandleCommandResult(0, '', ''),
+                        ('testpool', 'testgroup'),
+                        False,
+                    ),
+                ) as mock_ok_to_redeploy, mock.patch.object(
+                    nvmeof_service,
+                    'enable_gateway',
+                ) as mock_enable_gateway, mock.patch.object(
+                    cephadm_module,
+                    '_daemon_action',
+                ) as mock_daemon_action:
+                    CephadmServe(
+                        cephadm_module
+                    )._check_daemons()
+
+                mock_ok_to_redeploy.assert_called_once()
+
+                assert (
+                    mock_ok_to_redeploy.call_args.kwargs[
+                        'force'
+                    ]
+                    is True
+                )
+
+                mock_daemon_action.assert_called_once()
+
+                # Force bypassed the atomic disable path, so
+                # there is nothing for cephadm to re-enable.
+                mock_enable_gateway.assert_not_called()
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
+    def test_nvmeof_check_daemons_same_group_only_one_redeploy(
+        self,
+        _run_cephadm,
+        cephadm_module: CephadmOrchestrator,
+    ):
+        from mgr_module import HandleCommandResult
+
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+
+        spec = NvmeofServiceSpec(
+            service_id='testpool.testgroup',
+            pool='testpool',
+            group='testgroup',
+            placement=PlacementSpec(
+                hosts=['host1', 'host2'],
+            ),
+        )
+
+        cephadm_module.mock_store_set(
+            '_ceph_get',
+            'osd_map',
+            {
+                'pools': [
+                    {
+                        'pool': 1,
+                        'pool_name': 'testpool',
+                        'type': 1,
+                    },
+                ],
+            },
+        )
+
+        with with_host(cephadm_module, 'host1'):
+            with with_host(cephadm_module, 'host2'):
+                with with_service(
+                    cephadm_module,
+                    spec,
+                ):
+                    daemons = (
+                        cephadm_module.cache
+                        .get_daemons_by_type('nvmeof')
+                    )
+
+                    assert len(daemons) == 2
+
+                    for dd in daemons:
+                        cephadm_module._schedule_daemon_action(
+                            dd.name(),
+                            'redeploy',
+                        )
+
+                    nvmeof_service = (
+                        service_registry.get_service('nvmeof')
+                    )
+
+                    group = ('testpool', 'testgroup')
+
+                    def ok_to_redeploy(
+                        daemon,
+                        already_redeployed_groups,
+                        force=False,
+                    ):
+                        if group in already_redeployed_groups:
+                            return (
+                                HandleCommandResult(
+                                    -errno.EBUSY,
+                                    '',
+                                    'another gateway from this '
+                                    'group was already redeployed',
+                                ),
+                                group,
+                                False,
+                            )
+
+                        return (
+                            HandleCommandResult(0, '', ''),
+                            group,
+                            True,
+                        )
+
+                    with mock.patch.object(
+                        nvmeof_service,
+                        'ok_to_redeploy',
+                        side_effect=ok_to_redeploy,
+                    ) as mock_ok_to_redeploy, mock.patch.object(
+                        nvmeof_service,
+                        'enable_gateway',
+                        return_value=HandleCommandResult(
+                            0,
+                            '',
+                            '',
+                        ),
+                    ) as mock_enable_gateway, mock.patch.object(
+                        cephadm_module,
+                        '_daemon_action',
+                    ) as mock_daemon_action:
+                        CephadmServe(
+                            cephadm_module
+                        )._check_daemons()
+
+                    assert mock_ok_to_redeploy.call_count == 2
+
+                    # Both gateways were considered, but after the
+                    # first gateway from this group is redeployed,
+                    # the second one must be deferred.
+                    assert mock_daemon_action.call_count == 1
+                    assert mock_enable_gateway.call_count == 1
 
 
 class TestCephadmBinaryLoggingLevel:

@@ -15,6 +15,7 @@
 
 #include "common/pick_address.h"
 #include "include/util.h"
+#include "include/utime_fmt.h"
 #include "include/uuid_fmt.h"
 
 #include "messages/MCommand.h"
@@ -159,6 +160,10 @@ OSD::OSD(int id, uint32_t nonce,
   LOG_PREFIX(OSD::OSD);
   DEBUG("");
   ceph_assert(seastar::this_shard_id() == PRIMARY_CORE);
+
+  // Register as config observer to handle config changes
+  crimson::common::local_conf().add_observer(this);
+
   for (auto msgr : {std::ref(cluster_msgr), std::ref(public_msgr),
                     std::ref(hb_front_msgr), std::ref(hb_back_msgr)}) {
     msgr.get()->set_auth_server(monc.get());
@@ -177,7 +182,13 @@ OSD::OSD(int id, uint32_t nonce,
   clog->set_log_to_monitors(true);
 }
 
-OSD::~OSD() = default;
+OSD::~OSD()
+{
+  // Balances the add_observer() in the constructor: the config proxy keeps a
+  // raw pointer to the observer, so leaving it registered lets a later config
+  // change dereference a destroyed OSD.
+  crimson::common::local_conf().remove_observer(this);
+}
 
 namespace {
 // Initial features in new superblock.
@@ -574,9 +585,9 @@ seastar::future<> OSD::start()
     *monc, *hb_front_msgr, *hb_back_msgr);
   DEBUG("mounting store");
   co_await store.mount().handle_error(
-      crimson::stateful_ec::assert_failure(fmt::format(
+      crimson::stateful_ec::assert_failure(
         "{} error mounting object store in {}",
-        FNAME, local_conf().get_val<std::string>("osd_data")).c_str())
+        FNAME, local_conf().get_val<std::string>("osd_data"))
     );
   auto stats_seconds = local_conf().get_val<int64_t>("crimson_osd_stat_interval");
   if (stats_seconds > 0) {
@@ -887,13 +898,22 @@ seastar::future<> OSD::start_asok_admin()
     asok->register_command(make_asok_hook<SendBeaconHook>(*this));
     asok->register_command(make_asok_hook<RunOSDBenchHook>(*this));
     asok->register_command(make_asok_hook<FlushPgStatsHook>(*this));
+    asok->register_command(make_asok_hook<GetLatestOSDMapHook>(*this));
     asok->register_command(
       make_asok_hook<DumpPGStateHistory>(std::as_const(pg_shard_manager)));
     asok->register_command(make_asok_hook<DumpMetricsHook>());
     asok->register_command(make_asok_hook<DumpPerfCountersHook>());
+    asok->register_command(make_asok_hook<DumpScrubsHook>(get_shard_services()));
+    asok->register_command(make_asok_hook<DumpScrubReservationsHook>(get_shard_services()));
     asok->register_command(make_asok_hook<AssertAlwaysHook>());
     asok->register_command(make_asok_hook<InjectDataErrorHook>(get_shard_services()));
     asok->register_command(make_asok_hook<InjectMDataErrorHook>(get_shard_services()));
+    asok->register_command(make_asok_hook<SetOmapValHook>(get_shard_services()));
+    asok->register_command(make_asok_hook<RmOmapKeyHook>(get_shard_services()));
+    asok->register_command(make_asok_hook<SetOmapHeaderHook>(get_shard_services()));
+    asok->register_command(make_asok_hook<TruncObjHook>(get_shard_services()));
+    asok->register_command(make_asok_hook<WriteObjHook>(get_shard_services()));
+    asok->register_command(make_asok_hook<RemoveObjHook>(get_shard_services()));
     // PG commands
     asok->register_command(make_asok_hook<pg::PGOldFormCommand>(*this));
     asok->register_command(make_asok_hook<pg::QueryCommand>(*this));
@@ -906,6 +926,12 @@ seastar::future<> OSD::start_asok_admin()
                                                                   std::string_view{"deep-scrub"}));
     asok->register_command(make_asok_hook<pg::ScrubCommand<false>>(*this,
                                                                    std::string_view{"scrub"}));
+    asok->register_command(make_asok_hook<pg::ScheduleScrubCommand<false>>(*this,
+                                                                           std::string_view{"schedule-scrub"}));
+    asok->register_command(make_asok_hook<pg::ScheduleScrubCommand<true>>(*this,
+                                                                          std::string_view{"schedule-deep-scrub"}));
+    asok->register_command(make_asok_hook<pg::ScrubMetricsCommand>(*this));
+    asok->register_command(make_asok_hook<pg::ScrubDebugCommand>(*this));
     // ops commands
     asok->register_command(
       make_asok_hook<DumpInFlightOpsHook>(
@@ -1037,6 +1063,9 @@ OSD::do_ms_dispatch(
     return handle_osd_map(boost::static_pointer_cast<MOSDMap>(m));
   case CEPH_MSG_OSD_OP:
     return handle_osd_op(conn, boost::static_pointer_cast<MOSDOp>(m));
+  case CEPH_MSG_PING:
+    // clients ping connections with laggy ops, only to detect their reset
+    return seastar::now();
   case MSG_OSD_PG_CREATE2:
     return handle_pg_create(
       conn, boost::static_pointer_cast<MOSDPGCreate2>(m));
@@ -1075,6 +1104,8 @@ OSD::do_ms_dispatch(
     [[fallthrough]];
   case MSG_OSD_RECOVERY_RESERVE:
     [[fallthrough]];
+  case MSG_OSD_POOLMIGRATION_RESERVE:
+    [[fallthrough]];
   case MSG_OSD_PG_LOG:
     return handle_peering_op(conn, boost::static_pointer_cast<MOSDPeeringOp>(m));
   case MSG_OSD_PG_REMOVE:
@@ -1088,6 +1119,7 @@ OSD::do_ms_dispatch(
       conn, boost::static_pointer_cast<MOSDScrub2>(m));
   case MSG_OSD_REP_SCRUB:
   case MSG_OSD_REP_SCRUBMAP:
+  case MSG_OSD_SCRUB_RESERVE:
     return handle_scrub_message(
       conn,
       boost::static_pointer_cast<MOSDFastDispatchOp>(m));
@@ -1176,16 +1208,55 @@ void OSD::handle_authentication(const EntityName& name,
 
 std::vector<std::string> OSD::get_tracked_keys() const noexcept
 {
-  return {"osd_beacon_report_interval"s};
+  return {
+    "osd_beacon_report_interval"s,
+    "osd_scrub_min_interval"s,
+    "osd_scrub_max_interval"s,
+    "osd_scrub_interval_randomize_ratio"s,
+    "osd_deep_scrub_interval"s,
+    "osd_deep_scrub_interval_cv"s,
+    "osd_scrub_begin_hour"s,
+    "osd_scrub_end_hour"s,
+    "osd_scrub_begin_week_day"s,
+    "osd_scrub_end_week_day"s,
+    "osd_scrub_auto_repair"s
+  };
 }
 
 void OSD::handle_conf_change(
   const crimson::common::ConfigProxy& conf,
   const std::set <std::string> &changed)
 {
+  LOG_PREFIX(OSD::handle_conf_change);
   if (changed.contains("osd_beacon_report_interval")) {
     beacon_timer.rearm_periodic(
       std::chrono::seconds(conf->osd_beacon_report_interval));
+  }
+
+  // Check if any scrub-related config changed
+  static const std::set<std::string> scrub_configs = {
+    "osd_scrub_min_interval",
+    "osd_scrub_max_interval",
+    "osd_scrub_interval_randomize_ratio",
+    "osd_deep_scrub_interval",
+    "osd_deep_scrub_interval_cv",
+    "osd_scrub_begin_hour",
+    "osd_scrub_end_hour",
+    "osd_scrub_begin_week_day",
+    "osd_scrub_end_week_day",
+    "osd_scrub_auto_repair"
+  };
+
+  for (const auto& config : scrub_configs) {
+    if (changed.contains(config)) {
+      INFO("Scrub config changed: {}, updating scrub schedules", config);
+      if (shard_services.local_is_initialized()) {
+        (void)shard_services.invoke_on_all([](auto &local_service) {
+          local_service.get_scrub_scheduler().on_config_change();
+        });
+      }
+      break;
+    }
   }
 }
 
@@ -1259,6 +1330,18 @@ seastar::future<uint64_t> OSD::send_pg_stats()
   // mgr client sends the report message in background
   mgrc->report();
   co_return osd_stat.seq;
+}
+
+seastar::future<epoch_t> OSD::wait_for_latest_osdmap()
+{
+  LOG_PREFIX(OSD::wait_for_latest_osdmap);
+  ceph_assert(seastar::this_shard_id() == PRIMARY_CORE);
+  const auto [newest, oldest] = co_await monc->get_version("osdmap");
+  DEBUG("newest osdmap: {}, mine: {}", newest, osdmap->get_epoch());
+  // the OSD-level gate is updated only after all PGs have advanced
+  co_return co_await
+    get_shard_services().local_state.osdmap_gate.wait_for_map_untracked(
+      newest, &get_shard_services());
 }
 
 seastar::future<> OSD::handle_osd_map(Ref<MOSDMap> m)
@@ -1431,7 +1514,7 @@ seastar::future<> OSD::committed_osd_maps(
     co_await pg_shard_manager.broadcast_map_to_pgs(osdmap->get_epoch());
   } else {
     if (pg_shard_manager.is_prestop()) {
-      got_stop_ack();
+      got_stop_ack("committed_osd_maps");
     }
   }
 
@@ -1566,7 +1649,7 @@ seastar::future<> OSD::handle_scrub_command(
     [m, conn, this](spg_t pgid) {
     return pg_shard_manager.start_pg_operation<
       crimson::osd::ScrubRequested
-      >(m->deep, conn, m->epoch, pgid).second;
+      >(m->deep, m->repair, conn, m->epoch, pgid).second;
   });
 }
 
@@ -1585,7 +1668,7 @@ seastar::future<> OSD::handle_mark_me_down(
 {
   ceph_assert(seastar::this_shard_id() == PRIMARY_CORE);
   if (pg_shard_manager.is_prestop()) {
-    got_stop_ack();
+    got_stop_ack("handle_mark_me_down");
   }
   co_return;
 }
@@ -1893,6 +1976,17 @@ seastar::future<> OSD::check_osdmap_features()
   }
 }
 
+void OSD::got_stop_ack(const char* from)
+{
+  LOG_PREFIX(OSD::got_stop_ack);
+  if (!stop_acked.available()) {
+    INFO("osd.{}: stop acked via {}", whoami, from);
+    stop_acked.set_value();
+  } else {
+    DEBUG("osd.{}: stop already acked, ignoring {}", whoami, from);
+  }
+}
+
 seastar::future<> OSD::prepare_to_stop()
 {
   if (osdmap && osdmap->is_up(whoami)) {
@@ -1912,7 +2006,7 @@ seastar::future<> OSD::prepare_to_stop()
 	    osdmap->get_addrs(whoami),
 	    osdmap->get_epoch(),
 	    true)).then([this] {
-	return stop_acked.get_future();
+	return stop_acked.get_shared_future();
       }));
     } catch (seastar::timed_out_error&) {}
   }

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <deque>
 #include <map>
 #include <optional>
@@ -124,7 +125,7 @@ public:
       store_index_t store_index = 0);
     ~Shard() = default;
 
-    seastar::future<struct stat> stat(
+    stat_ertr::future<struct stat> stat(
       CollectionRef c,
       const ghobject_t& oid,
       uint32_t op_flags = 0) override final;
@@ -215,6 +216,10 @@ public:
     }
 
     omap_root_t select_log_omap_root(Onode& onode) const;
+
+    // Error injection
+    seastar::future<> inject_data_error(const ghobject_t& o) override final;
+    seastar::future<> inject_mdata_error(const ghobject_t& o) override final;
 
   // only exposed to SeaStore
   public:
@@ -382,7 +387,8 @@ public:
 
     tm_ret _remove(
       internal_context_t &ctx,
-      OnodeRef &onode);
+      OnodeRef &onode,
+      const ghobject_t &oid);
     tm_ret _touch(
       internal_context_t &ctx,
       Onode &onode);
@@ -459,6 +465,7 @@ public:
       internal_context_t &ctx,
       const coll_t& cid);
 
+    std::map<coll_t, boost::intrusive_ptr<SeastoreCollection>> coll_map;
     boost::intrusive_ptr<SeastoreCollection> _get_collection(const coll_t& cid);
 
     static constexpr auto LAT_MAX = static_cast<std::size_t>(op_type_t::MAX);
@@ -489,6 +496,17 @@ public:
       10, 15, 20, 30, 50, 100
     };
 
+    // Upper bounds (bytes) for the size of one key + value written to
+    // the xattr omap tree. 16384 is just above the largest entry that a
+    // 64 KiB leaf accepts (16,382 B).
+    static constexpr std::array<double, 10> XATTR_KV_SIZE_BUCKETS = {
+      64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 65536
+    };
+
+    // Clock for the xattr change time: the change of one attr takes
+    // microseconds, below the lowres_clock resolution.
+    using xattr_clock_t = std::chrono::steady_clock;
+
     static constexpr double TAIL_SLOW_MS = 5;        // 5 ms
     static constexpr double TAIL_VERY_SLOW_MS = 10;  // 10 ms
 
@@ -505,6 +523,20 @@ public:
       int64_t  onode_extents_delta = 0;
       uint64_t oi_inline = 0;          // OI stored in the onode's inline slot
       uint64_t oi_overflow = 0;        // OI too large, stored in the xattr omap tree
+      uint64_t ss_inline = 0;          // SnapSet stored in the onode's inline slot
+      uint64_t ss_overflow = 0;        // SnapSet too large, stored in the xattr omap tree
+
+      // xattr ops, like the classic chgattr_lat (setattr/setattrs/rmattr/rmattrs).
+      // Counted for each build of the transaction, so conflict replays
+      // count again.
+      uint64_t xattr_set_ops = 0;      // OP_SETATTR + OP_SETATTRS
+      uint64_t xattr_rm_ops = 0;       // OP_RMATTR + OP_RMATTRS
+      uint64_t xattr_change_count = 0; // all four ops
+      uint64_t xattr_change_usec = 0;  // time to apply them, sum
+      // Entries written to the xattr omap tree (not the inline OI/SnapSet)
+      uint64_t xattr_tree_set_records = 0;
+      uint64_t xattr_tree_set_bytes = 0;   // key + value
+      seastar::metrics::histogram xattr_tree_kv_size;
 
       // same metrics collected two more times for high tail txns.
       std::array<seastar::metrics::histogram, STAGE_MAX> stage_lat_slow;
@@ -519,6 +551,37 @@ public:
       stats.onode_updates        += ts.num_updates;
       stats.onode_erases         += ts.num_erases;
       stats.onode_extents_delta  += ts.extents_num_delta;
+    }
+
+    void add_xattr_change_sample(xattr_clock_t::time_point start) {
+      ++stats.xattr_change_count;
+      stats.xattr_change_usec += std::chrono::duration_cast<
+        std::chrono::microseconds>(xattr_clock_t::now() - start).count();
+    }
+
+    // Record the entries that _setattrs() writes to the xattr omap tree.
+    // Buckets are cumulative, as Prometheus expects: each bucket counts the
+    // entries up to its upper_bound, and the +Inf bucket (sample_count)
+    // counts all entries. So histogram_quantile() works on this metric.
+    void add_xattr_tree_sample(
+        const std::map<std::string, ceph::bufferlist>& aset) {
+      auto& hist = stats.xattr_tree_kv_size;
+      for (const auto& [key, val] : aset) {
+        const uint64_t len = key.size() + val.length();
+        ++stats.xattr_tree_set_records;
+        stats.xattr_tree_set_bytes += len;
+        if (hist.buckets.empty()) {
+          // register_metrics() did not run (store inactive)
+          continue;
+        }
+        for (auto& b : hist.buckets) {
+          if (len <= b.upper_bound) {
+            ++b.count;
+          }
+        }
+        ++hist.sample_count;
+        hist.sample_sum += len;
+      }
     }
 
     seastar::metrics::histogram& get_latency(
@@ -696,6 +759,14 @@ public:
     mutable seastar::lowres_clock::time_point last_tp =
       seastar::lowres_clock::time_point::min();
     mutable shard_stats_t last_shard_stats;
+
+    // Error injection support (no locks needed - single reactor per shard)
+    std::set<ghobject_t> debug_data_error_objects;
+    std::set<ghobject_t> debug_mdata_error_objects;
+
+    bool _debug_data_eio(const ghobject_t& o) const;
+    bool _debug_mdata_eio(const ghobject_t& o) const;
+    void _debug_obj_on_delete(const ghobject_t& o);
   };
 
 public:

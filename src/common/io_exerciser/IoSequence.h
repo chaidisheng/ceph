@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <optional>
+#include <vector>
+
 #include "IoOp.h"
 #include "include/random.h"
 
@@ -49,6 +52,9 @@ enum class Sequence {
   SEQUENCE_SEQ14,
   SEQUENCE_SEQ15,
   SEQUENCE_SEQ16,
+  SEQUENCE_SEQ17,
+  SEQUENCE_SEQ18,
+  SEQUENCE_SEQ19,
 
   SEQUENCE_END,
   SEQUENCE_BEGIN = SEQUENCE_SEQ0
@@ -59,6 +65,36 @@ inline Sequence operator++(Sequence& s) {
 }
 
 std::ostream& operator<<(std::ostream& os, const Sequence& seq);
+
+/* Parameters shared by the WriteTruncate sequences (Seq18 and Seq19) */
+// Seq18 tests many combinations. Seq19 injects errors, so only tests a few.
+
+// Objects are always created with this size (in blocks)
+constexpr uint64_t WRITE_TRUNCATE_OBJECT_SIZE = 24;
+// Truncates may shrink the object to this size (in blocks) ...
+constexpr uint64_t WRITE_TRUNCATE_MIN_SIZE = 10;
+// ... or grow it to this size (in blocks)
+constexpr uint64_t WRITE_TRUNCATE_MAX_SIZE = 30;
+
+// One WriteTruncate test case: a write followed by one (size2 unset) or
+// two (size2 set) truncates.
+struct WriteTruncateCase {
+  uint64_t offset;
+  uint64_t length;
+  uint64_t size1;
+  std::optional<uint64_t> size2;
+
+  // Size of the object after the write and the truncates have been applied.
+  uint64_t final_size() const { return size2 ? *size2 : size1; }
+};
+
+// Generates the write/truncate combinations. Writes start and finish at edge
+// positions relative to the object size and the truncate limits, and none of
+// them ends beyond max_write_end (blocks). Each write is combined with a set
+// of single truncate sizes and a set of truncate size pairs, all within
+// [WRITE_TRUNCATE_MIN_SIZE, WRITE_TRUNCATE_MAX_SIZE].
+std::vector<WriteTruncateCase> generate_write_truncate_cases(
+    uint64_t max_write_end);
 
 /* I/O Sequences */
 
@@ -353,6 +389,42 @@ class Seq16 : public IoSequence {
  public:
   Seq16(std::pair<int, int> obj_size_range, int seed, bool check_consistency);
   
+  Sequence get_id() const override;
+  std::string get_name() const override;
+  std::unique_ptr<IoOp> _next() override;
+};
+
+class Seq17 : public IoSequence {
+ private:
+  uint64_t truncate_size = 0;
+  std::vector<std::pair<uint64_t, uint64_t>> writes;
+  size_t write_index = 0;
+  bool donewrite = false;
+  bool doneread = false;
+
+  void setup_writes();
+
+ public:
+  Seq17(std::pair<int, int> obj_size_range, int seed, bool check_consistency);
+
+  Sequence get_id() const override;
+  std::string get_name() const override;
+  std::unique_ptr<IoOp> _next() override;
+};
+
+// Seq18: WriteTruncate and WriteTruncate2 operations on objects of a fixed
+// size, covering edge cases for the write location and the truncate sizes.
+class Seq18 : public IoSequence {
+ private:
+  enum class Stage { WRITE_TRUNCATE, READ, RESET };
+
+  std::vector<WriteTruncateCase> cases;
+  size_t case_idx;
+  Stage stage;
+
+ public:
+  Seq18(std::pair<int, int> obj_size_range, int seed, bool check_consistency);
+
   Sequence get_id() const override;
   std::string get_name() const override;
   std::unique_ptr<IoOp> _next() override;

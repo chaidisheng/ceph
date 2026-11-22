@@ -289,6 +289,8 @@ class DataProcessorFactory {
                          optional_yield y) = 0;
   virtual RGWGetObj_Filter* get_filter() = 0;
   virtual bool need_copy_data() = 0;
+  // true when the data is decrypted or encrypted
+  virtual bool need_crypt() { return need_copy_data(); }
   virtual void finalize_attrs(Attrs& attrs) { /* default implementation does nothing */ }
 
   /*
@@ -1262,6 +1264,7 @@ class Object {
                const ceph::real_time* mod_ptr, const ceph::real_time* unmod_ptr,
                bool high_precision_time,
                const char* if_match, const char* if_nomatch,
+               const char* dest_if_match, const char* dest_if_nomatch,
                AttrsMod attrs_mod, bool copy_if_newer, Attrs& attrs,
                RGWObjCategory category, uint64_t olh_epoch,
 	       boost::optional<ceph::real_time> delete_at,

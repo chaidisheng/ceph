@@ -514,6 +514,8 @@ MDSRank::MDSRank(
   purge_queue.update_op_limit(*mdsmap);
 
   objecter->unset_honor_pool_full();
+  // Clients must direct ops to the source of a pool migration
+  objecter->set_honor_pool_migration();
 
   finisher = new Finisher(cct, "MDSRank", "mds-rank-fin");
 
@@ -2055,6 +2057,9 @@ void MDSRank::reconnect_done()
 void MDSRank::rejoin_joint_start()
 {
   dout(1) << "rejoin_joint_start" << dendl;
+  // Refresh recovery_set so a creating->active rank picks up peers already
+  // in recovery, and a recovering rank picks up newly active survivors.
+  calc_recovery_set();
   mdcache->rejoin_send_rejoins();
 }
 void MDSRank::rejoin_start()
@@ -2418,6 +2423,7 @@ void MDSRankDispatcher::handle_mds_map(
 	    // -> stopped (missing) -> starting -> active
 	    restart.insert(r);
 	    mdcache->migrator->handle_mds_failure_or_stop(r);
+	    mdcache->drop_stray_requests_to(r);
 	    if (mdsmap->get_tableserver() == whoami)
 	      snapserver->handle_mds_failure_or_stop(r);
 	  }
@@ -2528,14 +2534,21 @@ void MDSRankDispatcher::handle_mds_map(
       set<mds_rank_t> olddis, dis;
       oldmap.get_mds_set_lower_bound(olddis, MDSMap::STATE_REJOIN);
       mdsmap->get_mds_set_lower_bound(dis, MDSMap::STATE_REJOIN);
+      bool send_rejoins = false;
       for (const auto& r : dis) {
 	if (r == whoami)
 	  continue; // not me
 	if (!olddis.count(r) || restart.count(r)) {  // newly so?
 	  mdcache->kick_discovers(r);
 	  mdcache->kick_open_ino_peers(r);
+	  send_rejoins = true;
 	}
       }
+      // Retry OP_WEAK that was skipped while this peer was still below
+      // rejoin. Only from rejoin, and only if an OP_WEAK was deferred:
+      // an active rank can still be importing/exporting.
+      if (send_rejoins && is_rejoin())
+	mdcache->rejoin_send_rejoins_if_pending();
     }
   }
 
@@ -2597,6 +2610,7 @@ void MDSRankDispatcher::handle_mds_map(
     for (const auto& r : stopped)
       if (oldstopped.count(r) == 0) {     // newly so?
 	mdcache->migrator->handle_mds_failure_or_stop(r);
+	mdcache->drop_stray_requests_to(r);
 	if (mdsmap->get_tableserver() == whoami)
 	  snapserver->handle_mds_failure_or_stop(r);
       }
@@ -2662,6 +2676,7 @@ void MDSRank::handle_mds_failure(mds_rank_t who)
   dout(5) << "handle_mds_failure mds." << who << dendl;
 
   mdcache->handle_mds_failure(who);
+  mdcache->drop_stray_requests_to(who);
 
   if (mdsmap->get_tableserver() == whoami)
     snapserver->handle_mds_failure_or_stop(who);
