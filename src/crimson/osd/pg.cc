@@ -1866,9 +1866,11 @@ seastar::future<> PG::stop()
   backend->on_actingset_changed(false);
 
   co_await merge_notify_gate.close();
+  co_await pg_mapping_notify_gate.close();
   co_await osdmap_gate.stop();
   co_await wait_for_active_blocker.stop();
-  client_request_orderer.clear_and_cancel(*this);
+  client_request_orderer.clear_and_cancel(*this,
+    std::make_exception_ptr(crimson::common::system_shutdown_exception{}));
   scrubber.stop();
   co_await recovery_handler->stop();
   co_await recovery_backend->stop();
@@ -1882,13 +1884,19 @@ void PG::on_change(ceph::os::Transaction &t) {
   obc_loader.notify_on_change(is_primary());
   recovery_backend->on_peering_interval_change(t);
   backend->on_actingset_changed(is_primary());
+  pg_mapping_notify_gate.dispatch_in_background(
+    "set_pg_primary", *this,
+    [this, primary=is_primary()] {
+      return shard_services.set_pg_primary(pgid, primary);
+    });
   wait_for_active_blocker.unblock();
   if (is_primary()) {
     logger().debug("{} {}: requeueing", *this, __func__);
     client_request_orderer.requeue(this);
   } else {
     logger().debug("{} {}: dropping requests", *this, __func__);
-    client_request_orderer.clear_and_cancel(*this);
+    client_request_orderer.clear_and_cancel(*this,
+      std::make_exception_ptr(crimson::common::actingset_changed(false)));
   }
   scrubber.on_interval_change();
   obc_registry.invalidate_on_interval_change();

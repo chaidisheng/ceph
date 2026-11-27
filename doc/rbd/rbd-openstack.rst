@@ -11,9 +11,10 @@ realize better performance than local drives on a standalone server!
 
 To use Ceph Block Devices with OpenStack, you must install QEMU, ``libvirt``,
 and OpenStack first. We recommend using a separate physical node for your
-OpenStack installation. OpenStack recommends a minimum of 8GB of RAM and a
-quad-core processor. The following diagram depicts the OpenStack/Ceph
-technology stack.
+OpenStack installation. For the hardware that OpenStack needs, see the
+`OpenStack Installation Guide
+<https://docs.openstack.org/install-guide/environment.html>`_. The following
+diagram depicts the OpenStack/Ceph technology stack.
 
 
 .. ditaa::
@@ -50,16 +51,15 @@ Three parts of OpenStack integrate with Ceph's block devices:
 
 - **Guest Disks**: Guest disks are guest operating system disks. By default,
   when you boot a virtual machine, its disk appears as a file on the file system
-  of the hypervisor (usually under ``/var/lib/nova/instances/<uuid>/``). Prior
-  to OpenStack Havana, the only way to boot a VM in Ceph was to use the
-  boot-from-volume functionality of Cinder. However, now it is possible to boot
-  every virtual machine inside Ceph directly without using Cinder, which is
+  of the hypervisor (usually under ``/var/lib/nova/instances/<uuid>/``). It is
+  possible to boot every virtual machine inside Ceph directly without using
+  Cinder, which is
   advantageous because it allows you to perform maintenance operations easily
   with the live-migration process. Additionally, if your hypervisor dies it is
   also convenient to trigger ``nova evacuate`` and reinstate the virtual machine
-  elsewhere almost seamlessly. In doing so,
-  :ref:`exclusive locks <rbd-exclusive-locks>` prevent multiple
-  compute nodes from concurrently accessing the guest disk.
+  elsewhere almost seamlessly. In doing so, the
+  :ref:`exclusive lock <rbd-exclusive-locks>` passes to the new compute node,
+  which first blocklists the old lock holder so that the OSDs refuse its writes.
 
 
 You can use OpenStack Glance to store images as Ceph Block Devices, and you
@@ -109,7 +109,7 @@ Configure OpenStack Ceph Clients
 The nodes running ``glance-api``, ``cinder-volume``, ``nova-compute`` and
 ``cinder-backup`` act as Ceph clients. Each requires the ``ceph.conf`` file::
 
-  ssh {your-openstack-server} sudo tee /etc/ceph/ceph.conf </etc/ceph/ceph.conf
+  ssh {your-openstack-server} 'sudo mkdir -p /etc/ceph && sudo tee /etc/ceph/ceph.conf' </etc/ceph/ceph.conf
 
 
 Install Ceph client packages
@@ -159,19 +159,29 @@ and Glance. Execute the following::
     ceph auth get-or-create client.cinder-backup mon 'profile rbd' osd 'profile rbd pool=backups' mgr 'profile rbd pool=backups'
 
 Add the keyrings for ``client.cinder``, ``client.glance``, and
-``client.cinder-backup`` to the appropriate nodes and change their ownership::
+``client.cinder-backup`` to the appropriate nodes and change their ownership and
+permissions::
 
   ceph auth get-or-create client.glance | ssh {your-glance-api-server} sudo tee /etc/ceph/ceph.client.glance.keyring
   ssh {your-glance-api-server} sudo chown glance:glance /etc/ceph/ceph.client.glance.keyring
-  ceph auth get-or-create client.cinder | ssh {your-volume-server} sudo tee /etc/ceph/ceph.client.cinder.keyring
+  ssh {your-glance-api-server} sudo chmod 0600 /etc/ceph/ceph.client.glance.keyring
+  ceph auth get-or-create client.cinder | ssh {your-cinder-volume-server} sudo tee /etc/ceph/ceph.client.cinder.keyring
   ssh {your-cinder-volume-server} sudo chown cinder:cinder /etc/ceph/ceph.client.cinder.keyring
+  ssh {your-cinder-volume-server} sudo chmod 0600 /etc/ceph/ceph.client.cinder.keyring
   ceph auth get-or-create client.cinder-backup | ssh {your-cinder-backup-server} sudo tee /etc/ceph/ceph.client.cinder-backup.keyring
   ssh {your-cinder-backup-server} sudo chown cinder:cinder /etc/ceph/ceph.client.cinder-backup.keyring
+  ssh {your-cinder-backup-server} sudo chmod 0600 /etc/ceph/ceph.client.cinder-backup.keyring
 
 Nodes running ``nova-compute`` need the keyring file for the ``nova-compute``
 process::
 
   ceph auth get-or-create client.cinder | ssh {your-nova-compute-server} sudo tee /etc/ceph/ceph.client.cinder.keyring
+  ssh {your-nova-compute-server} sudo chown nova:nova /etc/ceph/ceph.client.cinder.keyring
+  ssh {your-nova-compute-server} sudo chmod 0600 /etc/ceph/ceph.client.cinder.keyring
+
+If ``cinder-volume`` and ``nova-compute`` run on the same node, both services
+read this keyring. On that node, instead of the last two commands, give the
+keyring a group that both service users belong to, and mode 0640.
 
 They also need to store the secret key of the ``client.cinder`` user in
 ``libvirt``. The libvirt process needs it to access the cluster while attaching
@@ -180,7 +190,7 @@ a block device from Cinder.
 Create a temporary copy of the secret key on the nodes running
 ``nova-compute``::
 
-  ceph auth get-key client.cinder | ssh {your-compute-node} tee client.cinder.key
+  ceph auth get-key client.cinder | ssh {your-compute-node} 'umask 077; cat > client.cinder.key'
 
 Then, on the compute nodes, add the secret key to ``libvirt`` and remove the
 temporary copy of the key::
@@ -198,13 +208,14 @@ temporary copy of the key::
   EOF
   sudo virsh secret-define --file secret.xml
   Secret 457eb676-33da-42ec-9a8c-9293d545c337 created
-  sudo virsh secret-set-value --secret 457eb676-33da-42ec-9a8c-9293d545c337 --base64 $(cat client.cinder.key) && rm client.cinder.key secret.xml
+  sudo virsh secret-set-value --secret 457eb676-33da-42ec-9a8c-9293d545c337 --file client.cinder.key && rm client.cinder.key secret.xml
 
 Save the UUID of the secret for configuring ``nova-compute`` later.
 
-.. important:: You don't necessarily need the UUID on all the compute nodes.
-   However from a platform consistency perspective, it's better to keep the
-   same UUID.
+.. important:: Use the same UUID on every compute node. Cinder sends the
+   ``rbd_secret_uuid`` from ``cinder.conf`` to whichever compute node attaches
+   a volume, so a node whose secret has another UUID cannot attach Cinder
+   volumes.
 
 .. _CephX authentication: ../../rados/configuration/auth-config-ref/#enabling-disabling-cephx
 
@@ -277,7 +288,6 @@ specify the pool name for the block device. On your OpenStack node, edit
     [DEFAULT]
     ...
     enabled_backends = ceph
-    glance_api_version = 2
     ...
     [ceph]
     volume_driver = cinder.volume.drivers.rbd.RBDDriver
@@ -297,9 +307,6 @@ the secret you added to ``libvirt`` as documented earlier::
     rbd_user = cinder
     rbd_secret_uuid = 457eb676-33da-42ec-9a8c-9293d545c337
 
-Note that if you are configuring multiple cinder back ends,
-``glance_api_version = 2`` must be in the ``[DEFAULT]`` section.
-
 
 Configuring Cinder Backup
 -------------------------
@@ -307,7 +314,7 @@ Configuring Cinder Backup
 OpenStack Cinder Backup requires a specific daemon so don't forget to install it.
 On your Cinder Backup node, edit ``/etc/cinder/cinder.conf`` and add::
 
-    backup_driver = cinder.backup.drivers.ceph
+    backup_driver = cinder.backup.drivers.ceph.CephBackupDriver
     backup_ceph_conf = /etc/ceph/ceph.conf
     backup_ceph_user = cinder-backup
     backup_ceph_chunk_size = 134217728
@@ -340,7 +347,7 @@ In order to boot virtual machines directly from Ceph volumes, you must
 configure the ephemeral backend for Nova.
 
 It is recommended to enable the RBD cache in your Ceph configuration file; this
-has been enabled by default since the Giant release. Moreover, enabling the
+is enabled by default. Moreover, enabling the
 client admin socket allows the collection of metrics and can be invaluable
 for troubleshooting.
 
@@ -361,10 +368,17 @@ To enable RBD cache and admin sockets, ensure that on each hypervisor's
 Configure permissions for these directories::
 
     mkdir -p /var/run/ceph/guests/ /var/log/qemu/
-    chown qemu:libvirtd /var/run/ceph/guests /var/log/qemu/
+    chown qemu:qemu /var/run/ceph/guests /var/log/qemu/
 
-Note that user ``qemu`` and group ``libvirtd`` can vary depending on your system.
+Note that user ``qemu`` and group ``qemu`` can vary depending on your system.
 The provided example works for RedHat based systems.
+On Ubuntu, use ``libvirt-qemu:kvm``, and on Debian,
+``libvirt-qemu:libvirt-qemu``. The ``ceph-common`` package creates
+``/var/run/ceph`` with mode 0770 for user and group ``ceph``, so QEMU's user
+must also be able to enter that directory, for example as a member of the
+``ceph`` group. ``/var/run`` is emptied at boot, so create
+``/var/run/ceph/guests`` at boot as well, for example with a ``tmpfiles.d``
+entry.
 
 .. tip:: If your virtual machine is already running you can simply restart it to enable the admin socket
 
@@ -376,7 +390,7 @@ To activate the Ceph block device driver and load the block device pool name
 into the configuration, you must restart the related OpenStack services.
 For Debian based systems execute these commands on the appropriate nodes::
 
-    sudo glance-control api restart
+    sudo service glance-api restart
     sudo service nova-compute restart
     sudo service cinder-volume restart
     sudo service cinder-backup restart

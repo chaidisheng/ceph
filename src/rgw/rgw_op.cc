@@ -3812,11 +3812,11 @@ static int check_owner_max_buckets(const DoutPrefixProvider* dpp,
     remaining = s->user->get_max_buckets();
   }
 
-  if (remaining < 0) {
-    return -EPERM;
-  }
-  if (!remaining) { // unlimited
+  if (remaining < 0) { // unlimited
     return 0;
+  }
+  if (!remaining) {
+    return -EPERM;
   }
 
   const uint64_t chunk_size = dpp->get_cct()->_conf->rgw_list_buckets_max_chunk;
@@ -6539,6 +6539,9 @@ int RGWCopyObj::verify_permission(optional_yield y)
   boost::optional<Policy> src_policy;
   rgw_placement_rule src_placement;
 
+  // add server-side encryption headers
+  rgw_iam_add_crypt_attrs(s->env, s->info.crypt_attribute_map);
+
   /* get buckets info (source and dest) */
   if (s->local_source &&  source_zone.empty()) {
     s->src_object->set_atomic(true);
@@ -7518,6 +7521,7 @@ void RGWOptionsCORS::execute(optional_yield y)
   read_global_cors();
   if (!cors_exist) {
       ldpp_dout(this, 2) << "No CORS configuration set yet for this bucket nor globally" << dendl;
+      op_ret = -ENOENT;
       return;
   }
 
@@ -7531,11 +7535,6 @@ void RGWOptionsCORS::execute(optional_yield y)
   if (!req_meth) {
     ldpp_dout(this, 0) << "Missing mandatory Access-control-request-method header" << dendl;
     op_ret = -EINVAL;
-    return;
-  }
-  if (!cors_exist) {
-    ldpp_dout(this, 2) << "No CORS configuration set yet for this bucket" << dendl;
-    op_ret = -ENOENT;
     return;
   }
   req_hdrs = s->info.env->get("HTTP_ACCESS_CONTROL_REQUEST_HEADERS");

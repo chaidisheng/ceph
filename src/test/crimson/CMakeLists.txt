@@ -178,4 +178,24 @@ target_link_libraries(ceph_test_crimson_scrub_scheduling
 )
 install(TARGETS ceph_test_crimson_scrub_scheduling DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+add_executable(unittest-crimson-pg-shard-mapping
+  test_pg_shard_mapping.cc
+  ${PROJECT_SOURCE_DIR}/src/crimson/osd/pg_map.cc)
+target_link_libraries(
+  unittest-crimson-pg-shard-mapping
+  crimson
+  crimson::gtest
+  Boost::MPL)
+add_ceph_unittest(unittest-crimson-pg-shard-mapping
+  --memory 256M --smp 4)
+
 add_subdirectory(cbt)
+
+add_executable(unittest-crimson-operation-throttler
+  test_operation_throttler.cc
+  ${PROJECT_SOURCE_DIR}/src/crimson/osd/operation_throttler.cc
+  ${PROJECT_SOURCE_DIR}/src/crimson/osd/scheduler/scheduler.cc
+  ${PROJECT_SOURCE_DIR}/src/crimson/osd/scheduler/mclock_scheduler.cc)
+target_link_libraries(unittest-crimson-operation-throttler
+  crimson::gtest crimson-common Boost::MPL dmclock::dmclock)
+add_ceph_unittest(unittest-crimson-operation-throttler --memory 256M --smp 1)

@@ -2,6 +2,13 @@
 iSCSI Service
 =============
 
+.. warning::
+
+   The iSCSI gateway is deprecated. It is no longer in active development and
+   will not get new features. New deployments should access RBD images
+   directly from clients (``librbd``, QEMU, Kubernetes CSI, and similar) or use
+   the :ref:`NVMe-oF gateway <ceph-nvmeof>`. See :ref:`ceph-iscsi`.
+
 .. _cephadm-iscsi:
 
 Deploying iSCSI
@@ -22,13 +29,21 @@ service specification for iscsi:
       pool: mypool  # RADOS pool where ceph-iscsi config data is stored.
       trusted_ip_list: "IP_ADDRESS_1,IP_ADDRESS_2"
       api_port: ... # optional
-      api_user: ... # optional
-      api_password: ... # optional
-      api_secure: true/false # optional
+      api_user: ... # optional, default admin
+      api_password: ... # optional, default admin
+      api_secure: true/false # optional, default false
       ssl_cert: | # optional
         ...
       ssl_key: | # optional
         ...
+
+If you leave out ``api_user`` and ``api_password``, the gateway API accepts the
+user name ``admin`` with the password ``admin``. Set your own values.
+
+By default the API uses plain HTTP, so the user name and password cross the
+network unencrypted. To turn on HTTPS, give both ``ssl_cert`` and ``ssl_key``:
+they set ``api_secure`` to true. On Squid and Tentacle, ``api_secure: true``
+without them stops the gateway API from starting.
 
 For example:
 

@@ -2509,6 +2509,91 @@ class TestMirroring(CephFSTestCase):
         self.remove_directory(self.primary_fs_name, self.primary_fs_id, '/d0')
         self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
 
+    def test_cephfs_mirror_hole_fill_sync(self):
+        """Test snapshot sync of an object created between snapshots.
+
+        The mtimes are pinned as in test_cephfs_mirror_sparse_file_sync.
+        """
+        self.setup_mount_b(mds_perm='rw')
+        self.mount_a.run_shell(["mkdir", "d0"])
+
+        # 64MB sparse file, above cephfs_mirror_blockdiff_min_file_size
+        self.mount_a.run_shell(["truncate", "-s", "64M", "d0/sparse"])
+        self.mount_a.run_shell(["dd", "if=/dev/urandom", "of=d0/sparse", "bs=1M",
+                                "count=1", "conv=notrunc"])
+        self.mount_a.run_shell(["touch", "-m", "-d", "2020-01-01 00:00:00 UTC",
+                                "d0/sparse"])
+
+        self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.add_directory(self.primary_fs_name, self.primary_fs_id, '/d0')
+        self.peer_add(self.primary_fs_name, self.primary_fs_id,
+                      "client.mirror_remote@ceph", self.secondary_fs_name)
+
+        # snapshot 1: full sync
+        self.mount_a.run_shell(["mkdir", "d0/.snap/snap_a"])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               "client.mirror_remote@ceph", '/d0', 'snap_a', 1)
+        self.verify_snapshot('d0', 'snap_a')
+
+        # create object 8 between snap_a and snap_b
+        self.mount_a.run_shell(["dd", "if=/dev/urandom", "of=d0/sparse", "bs=1M",
+                                "seek=32", "count=1", "conv=notrunc"])
+        self.mount_a.run_shell(["touch", "-m", "-d", "2020-01-01 00:00:02 UTC",
+                                "d0/sparse"])
+        self.mount_a.run_shell(["mkdir", "d0/.snap/snap_b"])
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               "client.mirror_remote@ceph", '/d0', 'snap_b', 2)
+        self.verify_snapshot('d0', 'snap_b')
+
+        self.remove_directory(self.primary_fs_name, self.primary_fs_id, '/d0')
+        self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+
+    def test_cephfs_mirror_hole_fill_sync_snapped_inode(self):
+        """Test snapshot sync of an object created between snapshots and
+        rewritten after the newer one.
+
+        Snapshots are taken before mirroring starts so that every write has
+        landed before the diff is computed.  The mtimes are pinned as in
+        test_cephfs_mirror_sparse_file_sync.
+        """
+        self.setup_mount_b(mds_perm='rw')
+        self.mount_a.run_shell(["mkdir", "d0"])
+
+        self.mount_a.run_shell(["truncate", "-s", "64M", "d0/sparse"])
+        self.mount_a.run_shell(["dd", "if=/dev/urandom", "of=d0/sparse", "bs=1M",
+                                "count=1", "conv=notrunc"])
+        self.mount_a.run_shell(["touch", "-m", "-d", "2020-01-01 00:00:00 UTC",
+                                "d0/sparse"])
+        self.mount_a.run_shell(["mkdir", "d0/.snap/snap_a"])
+
+        # create object 8 between snap_a and snap_b
+        self.mount_a.run_shell(["dd", "if=/dev/urandom", "of=d0/sparse", "bs=1M",
+                                "seek=32", "count=1", "conv=notrunc"])
+        self.mount_a.run_shell(["touch", "-m", "-d", "2020-01-01 00:00:02 UTC",
+                                "d0/sparse"])
+        self.mount_a.run_shell(["mkdir", "d0/.snap/snap_b"])
+
+        # rewrite object 8 after snap_b
+        self.mount_a.run_shell(["dd", "if=/dev/urandom", "of=d0/sparse", "bs=1M",
+                                "seek=32", "count=1", "conv=notrunc"])
+        self.mount_a.run_shell(["touch", "-m", "-d", "2020-01-01 00:00:04 UTC",
+                                "d0/sparse"])
+        self.mount_a.run_shell(["mkdir", "d0/.snap/snap_c"])
+
+        self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.add_directory(self.primary_fs_name, self.primary_fs_id, '/d0')
+        self.peer_add(self.primary_fs_name, self.primary_fs_id,
+                      "client.mirror_remote@ceph", self.secondary_fs_name)
+
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               "client.mirror_remote@ceph", '/d0', 'snap_c', 3)
+        self.verify_snapshot('d0', 'snap_a')
+        self.verify_snapshot('d0', 'snap_b')
+        self.verify_snapshot('d0', 'snap_c')
+
+        self.remove_directory(self.primary_fs_name, self.primary_fs_id, '/d0')
+        self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+
     def test_cephfs_mirror_with_parent_snapshot(self):
         """Test snapshot synchronization with parent directory snapshots"""
         self.mount_a.run_shell(["mkdir", "-p", "d0/d1/d2/d3"])
@@ -4377,9 +4462,83 @@ class TestMirroring(CephFSTestCase):
 
             peer_uuid = self.get_peer_uuid(peer_spec)
             dirs = [f'/{idle_dir}', f'/{sync_dir}']
-            self.check_mgr_snapshot_mirror_status_scopes_match_asok(
-                self.primary_fs_name, self.primary_fs_id, f'/{sync_dir}',
-                peer_uuid, dirs, expected_state='syncing')
+
+            # Omap lags asok by about a tick, and the sync can finish before
+            # multi-scope mgr reads complete. Wait for omap syncing, snapshot
+            # asok, SIGSTOP so neither side can advance, then compare scopes.
+            # If a snap finishes before we catch syncing, dirty the tree and
+            # start another snap so we get a fresh syncing window. Only create
+            # the next extra snap after snaps_synced advances so the cap is
+            # not spent on snaps that are still queued.
+            next_snap = 1
+            max_extra_snaps = 5
+            snaps_synced_before_create = None
+            with safe_while(sleep=1, tries=90,
+                            action='freeze mirror while syncing') as proceed:
+                while proceed():
+                    last_mgr_stat = self.dir_status_from_mgr(
+                        self.primary_fs_name, f'/{sync_dir}', peer_uuid)
+                    asok_live = self.dir_status_from_asok(
+                        self.primary_fs_name, self.primary_fs_id,
+                        f'/{sync_dir}', peer_uuid)
+                    if (last_mgr_stat.get('state') != 'syncing' and
+                            asok_live.get('state') != 'syncing'):
+                        snaps_synced = asok_live.get('snaps_synced', 0)
+                        # Wait until the last extra snap is no longer queued
+                        # before creating another or failing the cap.
+                        if (snaps_synced_before_create is not None and
+                                snaps_synced <= snaps_synced_before_create):
+                            continue
+                        if next_snap > max_extra_snaps:
+                            self.fail(
+                                'exhausted '
+                                f'{max_extra_snaps} extra snaps without '
+                                'catching a syncing window; '
+                                f'mgr={last_mgr_stat.get("state")}, '
+                                f'asok={asok_live.get("state")}')
+                        self.mount_a.create_n_files(
+                            f'{sync_dir}/extra_{next_snap}', 3000,
+                            sync=True)
+                        for j in range(5):
+                            self.mount_a.write_n_mb(
+                                os.path.join(
+                                    sync_dir,
+                                    f'large_file.{next_snap}.{j}'),
+                                100)
+                        self.mount_a.run_shell(
+                            ['mkdir',
+                             f'{sync_dir}/.snap/snap{next_snap}'])
+                        snaps_synced_before_create = snaps_synced
+                        next_snap += 1
+                        continue
+                    if last_mgr_stat.get('state') != 'syncing':
+                        continue
+
+                    asok_res = self.peer_status(
+                        self.primary_fs_name, self.primary_fs_id, peer_uuid)
+                    asok_stat = self.peer_dir_status(
+                        asok_res, f'/{sync_dir}', peer_uuid)
+                    if asok_stat.get('state') != 'syncing':
+                        continue
+
+                    pid = self.get_mirror_daemon_pid()
+                    log.debug(f'SIGSTOP to cephfs-mirror pid {pid}')
+                    self.mount_a.run_shell(['kill', '-SIGSTOP', pid])
+                    try:
+                        # Sync may have completed between the asok snapshot and
+                        # STOP; only compare when omap is still frozen syncing.
+                        frozen = self.dir_status_from_mgr(
+                            self.primary_fs_name, f'/{sync_dir}', peer_uuid)
+                        if frozen.get('state') != 'syncing':
+                            continue
+                        self.assert_mgr_mirror_status_scopes(
+                            self.primary_fs_name, f'/{sync_dir}', peer_uuid,
+                            dirs, asok_res)
+                        break
+                    finally:
+                        log.debug('SIGCONT to cephfs-mirror')
+                        self.mount_a.run_shell(['kill', '-SIGCONT', pid])
+
             self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
         finally:
             self.enable_mgr_metrics_cache()

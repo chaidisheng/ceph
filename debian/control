@@ -86,7 +86,7 @@ Build-Depends: autoconf-archive,
                libzstd-dev <pkg.ceph.check>,
                libprotobuf-dev,
                libxsimd-dev <!pkg.ceph.arrow>,
-               meson <pkg.ceph.crimson>,
+               meson <pkg.ceph.crimson> <pkg.ceph.check>,
                ninja-build,
                nlohmann-json3-dev,
                patch,
@@ -105,8 +105,8 @@ Build-Depends: autoconf-archive,
                python3-xmltodict <pkg.ceph.check>,
                python3-openssl <pkg.ceph.check>,
                python3-prettytable <pkg.ceph.check>,
-               python3-pyelftools <pkg.ceph.crimson>,
-               python3-tabulate <pkg.ceph.crimson>,
+               python3-pyelftools <pkg.ceph.crimson> <pkg.ceph.check>,
+               python3-tabulate <pkg.ceph.crimson> <pkg.ceph.check>,
                python3-requests <pkg.ceph.check>,
                python3-scipy <pkg.ceph.check>,
                python3-onelogin-saml2 <pkg.ceph.check>,
@@ -251,6 +251,7 @@ Depends: ceph-base (= ${binary:Version}),
          ${shlibs:Depends},
 Recommends: ceph-mgr-alerts,
             ceph-mgr-cephadm,
+            ceph-mgr-ceph-secrets,
             ceph-mgr-cli-api,
             ceph-mgr-dashboard,
             ceph-mgr-diskprediction-local,
@@ -410,6 +411,18 @@ Description: cephadm orchestrator module for ceph-mgr
  This package contains the CEPHADM module for ceph-mgr's orchestration
  functionality, to allow ceph-mgr to perform orchestration functions
  over a standard SSH connection.
+
+Package: ceph-mgr-ceph-secrets
+Architecture: all
+Depends: ceph-mgr (= ${binary:Version}),
+         ${misc:Depends},
+         ${python3:Depends},
+Description: secrets module for ceph-mgr
+ Ceph is a massively scalable, open-source, distributed
+ storage system that runs on commodity hardware and delivers object,
+ block and file system storage.
+ .
+ This package contains the ceph_secrets module for ceph-mgr.
 
 Package: ceph-mgr-cli-api
 Architecture: all

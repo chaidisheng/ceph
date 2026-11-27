@@ -4,7 +4,7 @@
 
 .. index:: Ceph Block Device; encryption
 
-Starting with the Pacific release, image-level encryption can be handled
+Image-level encryption can be implemented
 internally by RBD clients. This means you can set a secret key that will be
 used to encrypt a specific RBD image. This page describes the scope of the
 RBD encryption feature.
@@ -124,6 +124,11 @@ into the image) and loaded by RBD encryption.
 .. note::
    Currently, only AES-128 and AES-256 encryption algorithms are supported.
    Additionally, xts-plain64 is currently the only supported encryption mode.
+
+.. warning:: Formatting writes the LUKS header over the beginning of the
+   image, and data already in the image cannot be read through the
+   encryption afterwards. Format only a new, empty image, or a new clone, as
+   in the examples below.
 
 To use the LUKS format, start by formatting the image:
 

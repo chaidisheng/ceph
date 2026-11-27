@@ -789,11 +789,21 @@ Usage::
 
     ceph mgr module enable <module>
 
-Subcommand ``module disable`` will disable an active Manager module.
+Subcommand ``module disable`` will disable an active Manager module. It
+refuses to disable an always-on module; see ``module force disable``.
 
 Usage::
 
     ceph mgr module disable <module>
+
+Subcommand ``module force disable`` will disable an always-on Manager module.
+Because this disables operations and removes commands that other Ceph tools
+expect, the command requires ``--yes-i-really-mean-it``. Subcommand ``module
+enable`` turns the module back on.
+
+Usage::
+
+    ceph mgr module force disable <module> --yes-i-really-mean-it
 
 Subcommand ``metadata`` will report metadata about all Manager daemons or, if
 the name is specified, a single Manager daemon.
@@ -1719,7 +1729,8 @@ Usage::
 
     ceph osd scrub <who>
 
-Subcommand ``set`` sets cluster-wide <flag> by updating OSD map.
+Subcommand ``set`` sets cluster-wide <flag> by updating the OSD map. More than
+one flag may be given in a single command, separated by spaces.
 The ``full`` flag is not honored anymore since the Mimic release, and
 ``ceph osd set full`` is not supported in the Octopus release.
 
@@ -1727,7 +1738,7 @@ Usage::
 
     ceph osd set pause|noup|nodown|noout|noin|nobackfill|norebalance|
     norecover|noscrub|nodeep-scrub|notieragent|nosnaptrim|
-    pglog_hardlimit|noautoscale
+    pglog_hardlimit|noautoscale [<flag>...]
 
 Subcommand ``setcrushmap`` sets CRUSH map from input file.
 
@@ -1814,13 +1825,14 @@ Usage::
 
     ceph osd unpause
 
-Subcommand ``unset`` unsets cluster-wide <flag> by updating OSD map.
+Subcommand ``unset`` unsets cluster-wide <flag> by updating the OSD map. More
+than one flag may be given in a single command, separated by spaces.
 
 Usage::
 
     ceph osd unset pause|noup|nodown|noout|noin|nobackfill|norebalance|
     norecover|noscrub|nodeep-scrub|notieragent|nosnaptrim|
-    noautoscale
+    noautoscale [<flag>...]
 
 
 pg

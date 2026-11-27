@@ -128,9 +128,12 @@ add_executable(unittest_peeringstate
 add_ceph_unittest(unittest_peeringstate)
 target_link_libraries(unittest_peeringstate osd os global ${CMAKE_DL_LIBS} ${BLKID_LIBRARIES})
 # pg_backend_test_fixture: object library for PGBackendTestFixture implementation
+# MockPeeringListener.cc required as PGBackendTestFixture.h pulls in
+# OsdTestFixture.h, which holds a unique_ptr<MockPeeringListener>.
 add_library(pg_backend_test_fixture OBJECT
   PGBackendTestFixture.cc
   MockPGBackendListener.cc
+  MockPeeringListener.cc
   MockStore.cc
   ObjectTracker.cc
 )
@@ -139,7 +142,6 @@ target_link_libraries(pg_backend_test_fixture osd os global GTest::GTest)
 # ec_peering_test_fixture: object library for ECPeeringTestFixture implementation
 add_library(ec_peering_test_fixture OBJECT
   ECPeeringTestFixture.cc
-  MockPeeringListener.cc
 )
 target_link_libraries(ec_peering_test_fixture osd os global GTest::GTest)
 
@@ -206,7 +208,7 @@ add_executable(unittest_ec_acting_stretch
   )
 add_ceph_unittest(unittest_ec_acting_stretch)
 target_link_libraries(unittest_ec_acting_stretch osd os global ${CMAKE_DL_LIBS} ${BLKID_LIBRARIES})
-add_dependencies(unittest_ec_acting_stretch ec_isa ec_jerasure)
+add_dependencies(unittest_ec_acting_stretch erasure_code_plugins)
 
 # unittest_stretch_ec_min_size
 add_executable(unittest_stretch_ec_min_size

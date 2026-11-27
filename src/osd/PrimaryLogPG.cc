@@ -2198,6 +2198,14 @@ void PrimaryLogPG::do_op_impl(OpRequestRef op, ThreadPool::TPHandle *handle)
   }
 
   if (m->get_flags() & CEPH_OSD_FLAG_EC_DIRECT_READ) {
+    if (!pgbackend->get_is_ec_optimized()) {
+      // A client only sends a direct read to an optimized EC pool. Refuse one
+      // to any other pool rather than serve it from the wrong place.
+      dout(4) << __func__ << ": direct read on a pool without EC optimizations "
+              << *m << dendl;
+      osd->reply_op_error(op, -EOPNOTSUPP);
+      return;
+    }
     // This means "is in acting set"
     if (is_primary() || is_nonprimary()) {
       op->set_ec_direct_read();
@@ -2395,6 +2403,18 @@ void PrimaryLogPG::do_op_impl(OpRequestRef op, ThreadPool::TPHandle *handle)
     dout(20) << __func__ << ": oid=" << head << " missing in direct read" << dendl;
     osd->reply_op_error(op, -EAGAIN);
     return;
+  }
+
+  // Older clients send a whole op to one shard when each read is within a
+  // chunk, even when the chunks belong to different shards.
+  if (m->has_flag(CEPH_OSD_FLAG_EC_DIRECT_READ)) {
+    int r = pgbackend->check_direct_read(m->ops);
+    if (r < 0) {
+      dout(4) << __func__ << ": direct read of data that is not this shard's "
+              << *m << dendl;
+      osd->reply_op_error(op, r);
+      return;
+    }
   }
 
   if (write_ordered) {
@@ -4622,12 +4642,10 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
       return;
     }
 
-    // version
-    ctx->at_version = get_next_version();
     ctx->mtime = m->get_mtime();
 
     dout(10) << __func__ << " " << soid << " " << *ctx->ops
-	     << " ov " << obc->obs.oi.version << " av " << ctx->at_version
+             << " ov " << obc->obs.oi.version
 	     << " snapc " << ctx->snapc
 	     << " snapset " << obc->ssc->snapset
 	     << dendl;
@@ -7553,7 +7571,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
 	dout(10) << "watch " << ceph_osd_watch_op_name(op.watch.op)
 		 << ": ctx->obc=" << (void *)obc.get() << " cookie=" << cookie
-		 << " oi.version=" << oi.version.version << " ctx->at_version=" << ctx->at_version << dendl;
+                 << " oi.version=" << oi.version.version << dendl;
 	dout(10) << "watch: oi.user_version=" << oi.user_version<< dendl;
 	dout(10) << "watch: peer_addr="
 	  << ctx->op->get_req()->get_connection()->get_peer_addr() << dendl;
@@ -9537,6 +9555,11 @@ int PrimaryLogPG::prepare_transaction(OpContext *ctx)
 
   // prepare the actual mutation
   int result = do_osd_ops(ctx, *ctx->ops);
+  if (ctx->op->may_write() || ctx->op->may_cache()) {
+    // an EC CALL can yield in do_osd_ops, so take the version after it
+    ctx->at_version = get_next_version();
+    dout(10) << __func__ << " av " << ctx->at_version << dendl;
+  }
   if (result < 0) {
     if (ctx->op->may_write() &&
 	get_osdmap()->require_osd_release >= ceph_release_t::kraken) {

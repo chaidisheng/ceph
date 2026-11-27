@@ -76,9 +76,8 @@ To configure Ceph for use with ``libvirt``, perform the following steps:
 
         rbd pool init <pool-name>
 
-#. :ref:`Create a Ceph User <rados_ops_adding_a_user>` (or use ``client.admin`` for version 0.9.7 and
-   earlier). The following example uses the Ceph user name ``client.libvirt``
-   and references ``libvirt-pool``. ::
+#. :ref:`Create a Ceph User <rados_ops_adding_a_user>`. The following example
+   uses the Ceph user name ``client.libvirt`` and references ``libvirt-pool``. ::
 
 	ceph auth get-or-create client.libvirt mon 'profile rbd' osd 'profile rbd pool=libvirt-pool'
 
@@ -197,8 +196,7 @@ commands, refer to `Virsh Command Reference`_.
 
 
    Replace ``/path/to/image/recent-linux.img`` with the path to the OS image.
-   The minimum kernel for using the faster ``virtio`` bus is 2.6.25. See
-   `Virtio`_ for details.
+   For the faster ``virtio`` bus, see `Virtio`_.
 
    **IMPORTANT:** Use ``sudo virsh edit`` instead of a text editor. If you edit
    the configuration file under ``/etc/libvirt/qemu`` with a text editor,
@@ -219,8 +217,9 @@ commands, refer to `Virsh Command Reference`_.
 
    Replace ``{monitor-host}`` with the name of your host, and replace the
    pool and/or image name as necessary. You may add multiple ``<host>``
-   entries for your Ceph monitors. The ``dev`` attribute is the logical
-   device name that will appear under the ``/dev`` directory of your
+   entries for your Ceph monitors. The ``dev`` attribute is a logical
+   device name. It is a hint for the order of the disks, and the guest may
+   give the disk another name under the ``/dev`` directory of your
    VM. The optional ``bus`` attribute indicates the type of disk device to
    emulate. The valid settings are driver specific (e.g., "ide", "scsi",
    "virtio", "xen", "usb" or "sata").
@@ -246,13 +245,14 @@ commands, refer to `Virsh Command Reference`_.
 	sudo virsh secret-define --file secret.xml
 	{uuid of secret}
 
-#. Get the ``client.libvirt`` key and save the key string to a file. ::
+#. Get the ``client.libvirt`` key and save the key string to a file that only
+   you can read. ::
 
-	ceph auth get-key client.libvirt | sudo tee client.libvirt.key
+	(umask 077; ceph auth get-key client.libvirt > client.libvirt.key)
 
-#. Set the UUID of the secret. ::
+#. Set the value of the secret. ::
 
-	sudo virsh secret-set-value --secret {uuid of secret} --base64 $(cat client.libvirt.key) && rm client.libvirt.key secret.xml
+	sudo virsh secret-set-value --secret {uuid of secret} --file client.libvirt.key && rm client.libvirt.key secret.xml
 
    You must also set the secret manually by adding the following ``<auth>``
    entry to the ``<disk>`` element you entered earlier (replacing the
@@ -271,7 +271,7 @@ commands, refer to `Virsh Command Reference`_.
 
 
    **NOTE:** The exemplary ID is ``libvirt``, not the Ceph name
-   ``client.libvirt`` as generated at step 2 of `Configuring Ceph`_. Ensure
+   ``client.libvirt`` as generated at step 3 of `Configuring Ceph`_. Ensure
    you use the ID component of the Ceph name you generated. If for some reason
    you need to regenerate the secret, you will have to execute
    ``sudo virsh secret-undefine {uuid}`` before executing

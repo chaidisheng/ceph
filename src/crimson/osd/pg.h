@@ -241,8 +241,13 @@ public:
     return false;
   }
 
-  seastar::future<bool> is_local_store_full() const {
-    return shard_services.is_local_storage_full(get_store_index());
+  // nullopt when this PG's data lives on another reactor.
+  std::optional<bool> resident_store_full() const {
+    return shard_services.resident_storage_full(get_store_index());
+  }
+  // May submit to the reactor that owns the store.
+  seastar::future<bool> is_store_full() const {
+    return shard_services.is_storage_full(get_store_index());
   }
 
   epoch_t get_last_peering_reset_epoch() const final {
@@ -1328,6 +1333,7 @@ private:
   // mon notifies in ShardServices. Gate them here so failures are logged and
   // PG::stop() waits for them to drain.
   crimson::common::Gated merge_notify_gate;
+  crimson::common::Gated pg_mapping_notify_gate;
 
   PGActivationBlocker wait_for_active_blocker;
   PglogBasedRecovery* pglog_based_recovery_op = nullptr;

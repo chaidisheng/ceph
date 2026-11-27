@@ -72,7 +72,7 @@ notable differences:
   This can be used for retrieving the disk path.
 * the ``service`` command was added, allowing ``rbd-wnbd`` to run as a Windows service.
   All mappings are by default persistent, being recreated when the service
-  stops, unless explicitly unmapped. The service disconnects the mappings
+  starts, unless explicitly unmapped. The service disconnects the mappings
   when being stopped.
 * the ``list`` command also includes a ``status`` column.
 
@@ -100,8 +100,8 @@ The following sample imports an RBD image and boots a Hyper-V VM using it::
     qemu-img convert -O raw cirros-0.5.1-x86_64-disk.img cirros-0.5.1-x86_64-disk.raw
 
     rbd import cirros-0.5.1-x86_64-disk.raw
-    # Let's give it a hefty 100MB size.
-    rbd resize cirros-0.5.1-x86_64-disk.raw --size=100MB
+    # Let's give it a hefty 200MB size.
+    rbd resize cirros-0.5.1-x86_64-disk.raw --size=200MB
 
     rbd device map cirros-0.5.1-x86_64-disk.raw
 

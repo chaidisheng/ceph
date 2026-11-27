@@ -28,12 +28,6 @@
 #include "MockMessenger.h"
 #include "global/global_context.h"
 
-#ifdef WITH_CRIMSON
-#include "crimson/common/perf_counters_collection.h"
-#else
-#include "common/perf_counters_collection.h"
-#endif
-
 // Forward declarations
 class EventLoop;
 
@@ -85,9 +79,7 @@ class MockPeeringListener : public PeeringState::PeeringListener {
     backend_listener = std::make_unique<MockPGBackendListener>(osdmap, pool_id, dpp, pg_whoami);
     backend = std::make_unique<MockPGBackend>(g_ceph_context, backend_listener.get(), nullptr, coll, ch);
     recoverystate_perf = build_recoverystate_perf(g_ceph_context);
-    g_ceph_context->get_perfcounters_collection()->add(recoverystate_perf);
     logger_perf = build_osd_logger(g_ceph_context);
-    g_ceph_context->get_perfcounters_collection()->add(logger_perf);
   }
   MockPeeringListener(OSDMapRef osdmap,
                       int64_t pool_id,
@@ -105,9 +97,7 @@ class MockPeeringListener : public PeeringState::PeeringListener {
     backend = std::make_unique<MockPGBackend>(
       g_ceph_context, backend_listener.get(), object_store, coll, ch);
     recoverystate_perf = build_recoverystate_perf(g_ceph_context);
-    g_ceph_context->get_perfcounters_collection()->add(recoverystate_perf);
     logger_perf = build_osd_logger(g_ceph_context);
-    g_ceph_context->get_perfcounters_collection()->add(logger_perf);
   }
 
 
@@ -116,12 +106,10 @@ class MockPeeringListener : public PeeringState::PeeringListener {
     ps  = nullptr;
     ctx = nullptr;
     if (recoverystate_perf) {
-      g_ceph_context->get_perfcounters_collection()->remove(recoverystate_perf);
       delete recoverystate_perf;
       recoverystate_perf = nullptr;
     }
     if (logger_perf) {
-      g_ceph_context->get_perfcounters_collection()->remove(logger_perf);
       delete logger_perf;
       logger_perf = nullptr;
     }
@@ -357,11 +345,17 @@ class MockPeeringListener : public PeeringState::PeeringListener {
     activate_called = true;
   }
 
+  // Clears the PG's object contexts, as PrimaryLogPG::on_change() does.
+  std::function<void()> clear_object_contexts;
+
   void on_change(ObjectStore::Transaction &t) override {
     first_write_in_interval = true;
     change_called = true;
     if (pg_backend) {
       pg_backend->on_change();
+    }
+    if (clear_object_contexts) {
+      clear_object_contexts();
     }
   }
 

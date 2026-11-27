@@ -137,6 +137,12 @@ List volumes by running the following command:
 
    ceph fs volume ls
 
+List volumes using search string filter by running following command:
+
+.. prompt:: bash #
+
+   ceph fs volume ls [--filter <filter_string>]
+
 Rename a volume by running a command of the following form:
 
 .. prompt:: bash #
@@ -256,7 +262,7 @@ A subvolume group can be created in a separate RADOS namespace by specifying
 the ``--namespace-isolated`` option. When a subvolume group has namespace
 isolation enabled, the group directory is placed in its own RADOS namespace
 (``fsvolumens__<group>``), and any subvolume subsequently created within that
-group automatically inherits namespace isolation -- each subvolume gets its
+group automatically inherits namespace isolation. Each subvolume gets its
 own unique RADOS namespace (``fsvolumens__<group>_<subvolume>``) without
 needing the ``--namespace-isolated`` flag on the ``fs subvolume create``
 command. This provides security isolation at the RADOS level for all
@@ -326,6 +332,12 @@ List subvolume groups by running a command of the following form:
 .. prompt:: bash #
 
    ceph fs subvolumegroup ls <vol_name>
+
+List subvolume groups using search string filter by running a command of the following form:
+
+.. prompt:: bash #
+
+   ceph fs subvolumegroup ls <vol_name> [--filter <filter_string>]
 
 .. note:: Subvolume group snapshot feature is no longer supported in mainline CephFS (existing group
           snapshots can still be listed and deleted).
@@ -403,6 +415,12 @@ List snapshots of a subvolume group by running a command of the following form:
 .. prompt:: bash #
 
    ceph fs subvolumegroup snapshot ls <vol_name> <group_name>
+
+List snapshots of a subvolume group with search string filter by running a command of the following form:
+
+.. prompt:: bash #
+
+   ceph fs subvolumegroup snapshot ls <vol_name> <group_name> [--filter <filter_string>]
 
 
 FS Subvolumes
@@ -713,6 +731,12 @@ Use a command of the following form to list subvolumes:
 
    ceph fs subvolume ls <vol_name> [--group_name <subvol_group_name>]
 
+Use a command of the following form to list subvolumes with search string filter:
+
+.. prompt:: bash #
+
+   ceph fs subvolume ls <vol_name> [--group_name <subvol_group_name>] [--filter <filter_string>]
+
 .. note:: Subvolumes that have been removed but have snapshots retained, are
    also listed.
 
@@ -881,6 +905,12 @@ Use a command of the following form to list the snapshots of a subvolume:
 
    ceph fs subvolume snapshot ls <vol_name> <subvol_name> [--group_name <subvol_group_name>]
 
+Use a command of the following form to list the snapshots of a subvolume with search string filter:
+
+.. prompt:: bash #
+
+   ceph fs subvolume snapshot ls <vol_name> <subvol_name> [--group_name <subvol_group_name>] [--filter <filter_string>]
+
 Fetching a Snapshot's Information
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -892,6 +922,7 @@ Use a command of the following form to fetch a snapshot's information:
 
 The output format is JSON and contains the following fields.
 
+* ``bytes_quota``: quota size in bytes if quota is set; else ``infinite``
 * ``created_at``: creation time of the snapshot in the format ``YYYY-MM-DD
   HH:MM:SS:ffffff``
 * ``data_pool``: data pool to which the snapshot belongs
@@ -911,7 +942,8 @@ Sample output when snapshot clones are in progress or pending:
 ::
 
     {
-        "created_at": "2022-06-14 13:54:58.618769",
+        "bytes_quota": 3072,
+        "created_at": "2025-01-21 10:54:45.687621",
         "data_pool": "cephfs.cephfs.data",
         "has_pending_clones": "yes",
         "pending_clones": [
@@ -938,7 +970,8 @@ Sample output when no snapshot clone is in progress or pending:
 ::
 
     {
-        "created_at": "2022-06-14 13:54:58.618769",
+        "bytes_quota": 3072,
+        "created_at": "2025-01-21 10:54:45.687621",
         "data_pool": "cephfs.cephfs.data",
         "has_pending_clones": "no"
     }
@@ -1396,6 +1429,14 @@ group:
 This enables distributed subtree partitioning policy for the "csi" subvolume
 group. This will cause every subvolume within the group to be automatically
 pinned to one of the available ranks on the file system.
+
+.. note:: Setting pins on the default group i.e. ``_nogroup`` is allowed.
+
+Here's an example of setting pins on the default group:
+
+.. prompt:: bash #
+
+   ceph fs subvolumegroup pin <vol_name> _nogroup <pin_type> <pin_setting>
 
 Normalization and Case Sensitivity
 ----------------------------------
@@ -2158,11 +2199,11 @@ on these see: :ref:`Pause Purge threads<pause-purge-threads>` and :ref:`Pause Cl
 
 
 
-.. note:: Pool namespace for CephFS volumes until Tentacle release had names in
-   this format: "fsvolumens__<subvol-name>". However, this could lead to clash
-   in namespace when two subvolumes of same were located in this different
-   subvolume group. And therefore after Tentacle pool namespace format was
-   changed to "fsvolumens__<subvol-grp-name>_<subvol-name>".
+.. note:: Before Squid 19.2.4, pool namespaces for CephFS subvolumes had names
+   of the form "fsvolumens_<subvol-name>". However, this could lead to a
+   namespace clash when two subvolumes with the same name were located in
+   different subvolume groups. Squid 19.2.4 and later, and all Tentacle and
+   later releases, use the format "fsvolumens__<subvol-grp-name>_<subvol-name>".
 
 
 .. _manila: https://github.com/openstack/manila

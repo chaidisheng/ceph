@@ -5,6 +5,7 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 
 #include <boost/intrusive_ptr.hpp>
 #include <seastar/core/future.hh>
@@ -425,6 +426,9 @@ class ShardServices : public OSDMapService,
     static_cast<size_t>(OperationTypeCode::last_op)> pg_op_shard_local{};
   std::array<uint64_t,
     static_cast<size_t>(OperationTypeCode::last_op)> pg_op_shard_remote{};
+  std::array<uint64_t,
+    static_cast<size_t>(OperationTypeCode::last_op)> pg_op_shard_executed{};
+  int64_t client_ops_in_flight = 0;
   seastar::metrics::metric_groups metrics;
   void register_metrics();
 
@@ -600,16 +604,26 @@ public:
   seastar::future<> shutdown_cluster_lane();
   seastar::future<> mark_down_cluster_lane(entity_addr_t addr);
 
+  void client_op_started() {
+    ++client_ops_in_flight;
+  }
+  void client_op_finished() {
+    --client_ops_in_flight;
+  }
+
   crimson::os::BackendStore get_store(store_index_t store_index) const {
     auto store = local_state.b_store;
     store.store_index = store_index;
     return store;
   }
 
-  seastar::future<bool> is_local_storage_full(store_index_t store_index) const {
-    return crimson::os::with_store<&crimson::os::FuturizedStore::Shard::is_storage_full>(
-        get_store(store_index));
-  }
+  // Fullness when this reactor hosts the store. nullopt when the store
+  // lives on another reactor: the local SeaStore shard is inactive, and
+  // get_sharded_store() would abort. Call is_storage_full() for that case.
+  std::optional<bool> resident_storage_full(store_index_t store_index) const;
+  // Fullness of the store that holds this PG's data. May submit to the
+  // owning reactor.
+  seastar::future<bool> is_storage_full(store_index_t store_index) const;
 
   struct shard_stats_t {
     double reactor_utilization;
@@ -622,12 +636,18 @@ public:
     return pg_to_shard_mapping.dump_store_shards(f);
   }
 
+  /// Whether this OSD is the up primary of pgid (and, for EC, holds the
+  /// primary shard), according to the current osdmap. Used to place the pg.
+  bool is_mapping_primary(spg_t pgid) const;
+
   auto create_split_pg_mapping(spg_t pgid, core_id_t core, store_index_t store_index) {
-    return pg_to_shard_mapping.get_or_create_pg_mapping(pgid, core, store_index);
+    return pg_to_shard_mapping.get_or_create_pg_mapping(
+      pgid, core, store_index, is_mapping_primary(pgid));
   }
 
   seastar::future<core_id_t> get_pg_mapping(spg_t pgid) {
-    return pg_to_shard_mapping.get_or_create_pg_mapping(pgid).then(
+    return pg_to_shard_mapping.get_or_create_pg_mapping(
+      pgid, NULL_CORE, NULL_STORE_INDEX, false).then(
       [](std::pair<core_id_t, store_index_t> mapping) {
         return mapping.first;
       });
@@ -638,7 +658,12 @@ public:
   /// on the correct reactor rather than dispatching cross-shard.
   seastar::future<std::pair<core_id_t, store_index_t>> get_pg_core_and_store(
     spg_t pgid) {
-    return pg_to_shard_mapping.get_or_create_pg_mapping(pgid);
+    return pg_to_shard_mapping.get_or_create_pg_mapping(
+      pgid, NULL_CORE, NULL_STORE_INDEX, false);
+  }
+
+  seastar::future<> set_pg_primary(spg_t pgid, bool is_primary) {
+    return pg_to_shard_mapping.set_pg_primary(pgid, is_primary);
   }
 
   auto remove_pg(spg_t pgid) {
@@ -818,8 +843,9 @@ public:
     snap_dump_reservations,
     snap_reserver.dump)
 
-  bool throttle_available() const {
-    return local_state.throttler.available();
+  bool throttle_available(
+    crimson::osd::scheduler::throttle_level_t level) const {
+    return local_state.throttler.available(level);
   }
 
   auto is_recovery_active() {
